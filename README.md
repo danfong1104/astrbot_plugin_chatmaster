@@ -119,4 +119,3 @@
 
 ---
 
-**Enjoy your community! 🎈**
