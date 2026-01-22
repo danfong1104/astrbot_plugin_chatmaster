@@ -5,10 +5,12 @@ import copy
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
-from astrbot.api.all import Context, AstrMessageEvent, Star
+# 1. 关键修复：直接从 api.all 导入 EventMessageType，这是最安全的路径
+from astrbot.api.all import Context, AstrMessageEvent, Star, EventMessageType
 from astrbot.api import logger
 from astrbot.api.star import StarTools
-from astrbot.api.event import filter as astr_filter, EventMessageType
+# 2. 这里的导入只保留 filter
+from astrbot.api.event import filter as astr_filter
 
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300       # 自动保存间隔 (秒)
@@ -175,7 +177,7 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
-    # 🛠️ 关键修复：添加 *args, **kwargs 以接收多余参数
+    # 3. 修复参数不匹配：添加 *args, **kwargs
     @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent, *args, **kwargs):
         message_obj = event.message_obj
@@ -199,7 +201,7 @@ class ChatMasterPlugin(Star):
         self.data["groups"][group_id][user_id] = time.time()
         self.data_changed = True 
 
-    # 🛠️ 关键修复：添加 *args, **kwargs 以接收多余参数
+    # 4. 修复参数不匹配：添加 *args, **kwargs
     @astr_filter.command("聊天检测")
     async def manual_check(self, event: AstrMessageEvent, *args, **kwargs):
         message_obj = event.message_obj
