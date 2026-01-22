@@ -6,14 +6,14 @@ import copy
 import tempfile
 from datetime import datetime
 from typing import Dict, Any, Tuple
+from pathlib import Path
 
-# 1. 导入 StarTools 用于获取标准数据路径
-from astrbot.api.all import *
+# 1. 规范化导入：移除 import *，解决热重载时的命名空间污染问题
+from astrbot.api.all import Context, AstrMessageEvent, Star
 from astrbot.api.event import filter
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 
-# 2. 移除 @register 装饰器 (官方已废弃，框架会自动识别 Star 子类)
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300       # 自动保存间隔
     CHECK_INTERVAL = 60       # 检查循环间隔
@@ -29,14 +29,14 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
-        # 3. 修复数据路径：使用 StarTools 获取标准存储位置
-        # 这能避免容器化部署时数据丢失，且解决了权限问题
-        self.data_dir = StarTools.get_data_dir("astrbot_plugin_chatmaster")
-        self.data_file = os.path.join(self.data_dir, "data.json")
+        # 2. 修复路径操作：统一使用 Pathlib (官方建议)
+        # StarTools.get_data_dir 返回的是 Path 对象
+        self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
+        # 使用 / 运算符拼接路径，替代 os.path.join
+        self.data_file = self.data_dir / "data.json"
         
-        # 确保目录存在
-        if not os.path.exists(self.data_dir):
-            os.makedirs(self.data_dir, exist_ok=True)
+        # 使用 Pathlib 的 mkdir 方法，更优雅
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         
         self.data = self.load_data()
         
@@ -46,7 +46,7 @@ class ChatMasterPlugin(Star):
         self.enable_whitelist_global = True
         self.enable_mapping = True
         
-        # 调度器状态锁，防止同一分钟重复执行
+        # 调度器状态锁
         self.last_processed_minute = -1
         
         # 初始化配置
@@ -56,7 +56,7 @@ class ChatMasterPlugin(Star):
         # 启动提示
         server_time = datetime.now().strftime("%H:%M")
         last_run = self.data.get("global_last_run_date", "无记录")
-        logger.info(f"ChatMaster v2.1.0 已加载 (Audit Fix)。")
+        logger.info(f"ChatMaster v2.1.0 已加载 (Pathlib Fix)。")
         logger.info(f" -> 数据路径: {self.data_file}")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
@@ -77,6 +77,7 @@ class ChatMasterPlugin(Star):
             return 9, 0
 
     def refresh_config_cache(self):
+        """刷新配置缓存"""
         self.enable_whitelist_global = self.config.get("enable_whitelist", True)
         self.enable_mapping = self.config.get("enable_nickname_mapping", True)
         
@@ -107,7 +108,8 @@ class ChatMasterPlugin(Star):
                             name = parts[1].strip()
                             mapping[qq] = name
                 except Exception as e:
-                    logger.warning(f"ChatMaster 配置警告: '{item}' 无效 -> {e}")
+                    # 降低日志级别为 debug，防止启动时因格式问题刷屏
+                    # logger.debug(f"ChatMaster 配置解析跳过: '{item}' -> {e}")
                     continue
         self.nickname_cache = mapping
 
@@ -119,32 +121,36 @@ class ChatMasterPlugin(Star):
 
     def load_data(self) -> Dict[str, Any]:
         default_data = {"global_last_run_date": "", "groups": {}}
-        if not os.path.exists(self.data_file):
+        # Pathlib 风格的文件检查
+        if not self.data_file.exists():
             return default_data
         try:
-            with open(self.data_file, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-                if not content:
-                    return default_data
-                loaded = json.loads(content)
-                if not isinstance(loaded, dict):
-                    return default_data
-                if "groups" not in loaded:
-                    loaded["groups"] = {}
-                if "global_last_run_date" not in loaded:
-                    loaded["global_last_run_date"] = ""
-                return loaded
+            # Pathlib 读取文本
+            content = self.data_file.read_text(encoding='utf-8').strip()
+            if not content:
+                return default_data
+            loaded = json.loads(content)
+            if not isinstance(loaded, dict):
+                return default_data
+            if "groups" not in loaded:
+                loaded["groups"] = {}
+            if "global_last_run_date" not in loaded:
+                loaded["global_last_run_date"] = ""
+            return loaded
         except Exception as e:
             logger.error(f"ChatMaster 加载数据失败: {e}，使用空数据。")
             return default_data
 
     def _save_data_atomic(self, data_snapshot: Dict[str, Any]):
+        """原子化保存 (适配 Pathlib)"""
         temp_path = None
         try:
-            # 4. 优化：在 data_dir 下创建临时文件，避免跨卷移动导致的权限问题
+            # 在同一目录下创建临时文件，避免跨文件系统移动导致的权限问题
             fd, temp_path = tempfile.mkstemp(dir=self.data_dir, text=True)
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data_snapshot, f, ensure_ascii=False, indent=2)
+            
+            # 使用 os.replace 覆盖原文件 (Path 对象在 Py3.6+ 支持直接传入)
             os.replace(temp_path, self.data_file)
         except Exception as e:
             logger.error(f"ChatMaster 保存数据失败: {e}")
@@ -272,6 +278,10 @@ class ChatMasterPlugin(Star):
     async def scheduler_loop(self):
         while True:
             try:
+                # 3. 修复逻辑缺陷：每次循环都刷新配置
+                # 这样修改配置文件后，无需重启插件即可在下一分钟生效
+                self.refresh_config_cache()
+                
                 target_h, target_m = self._parse_push_time()
                 await self.check_schedule(target_h, target_m)
                 
@@ -296,24 +306,21 @@ class ChatMasterPlugin(Star):
         current_minutes = now.hour * 60 + now.minute
         target_minutes = target_h * 60 + target_m
         
-        # 5. 修复调度逻辑：使用状态锁防止重复执行，移除 now.second < 10 的脆弱判断
-        # 如果这一分钟已经处理过，直接跳过
+        # 状态锁：防止同一分钟重复执行
         if current_minutes == self.last_processed_minute:
             return
         
-        # 更新状态锁
         self.last_processed_minute = current_minutes
         
         is_time_up = (current_minutes == target_minutes)
         in_window = (current_minutes - target_minutes) <= (self.CATCH_UP_WINDOW * 60)
         
-        # 如果机器人启动时已经过了时间，但还在窗口期内，也视为“时间到了”
         if current_minutes > target_minutes and in_window:
             is_time_up = True
 
         last_run = self.data.get("global_last_run_date", "")
         
-        # 逻辑分支1：今天没跑过 -> 正常推送
+        # 逻辑1：正常推送
         if is_time_up and last_run != today_date_str:
             if in_window:
                 logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d} (今日首次)，执行任务...")
@@ -326,7 +333,7 @@ class ChatMasterPlugin(Star):
             await self.save_data()
             return
 
-        # 逻辑分支2：今天跑过了，但正好是那个整点 -> 打印后台日志告知原因
+        # 逻辑2：后台自检 (已跑过 + 整点)
         if current_minutes == target_minutes and last_run == today_date_str:
             logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d} (今日已执行过)，执行后台自检...")
             await self.run_inspection(send_message=False)
