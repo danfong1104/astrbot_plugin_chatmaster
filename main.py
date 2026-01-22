@@ -2,18 +2,19 @@ import json
 import time
 import asyncio
 from datetime import datetime
-# 显式导入所需类，避免命名空间污染
-from astrbot.api.all import Context, AstrMessageEvent, Star, register
+# 1. 显式导入 EventMessageType，修复路径风险
+from astrbot.api.all import Context, AstrMessageEvent, Star
 from astrbot.api import logger
 from astrbot.api.star import StarTools
-# 使用别名避免遮蔽内置 filter 函数
-from astrbot.api.event import filter as astr_filter
+from astrbot.api.event import filter as astr_filter, EventMessageType
 
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "1.3.0")
+# 2. 移除 @register 装饰器，符合 AstrBot v4+ 最佳实践
+# 插件元数据现在完全由 metadata.yaml 控制
 class ChatMasterPlugin(Star):
-    # 定义类常量，消除魔术数字
+    # 定义类常量
     SAVE_INTERVAL = 300  # 数据自动保存间隔 (秒)
     CHECK_INTERVAL = 60  # 定时任务检查间隔 (秒)
+    MAX_RETRIES = 3      # 消息发送最大重试次数
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -21,21 +22,17 @@ class ChatMasterPlugin(Star):
         self.data_changed = False 
         self.last_save_time = time.time()
         
-        # 使用官方工具获取规范数据路径
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = self.data_dir / "data.json"
         
         self.data = self.load_data()
         
-        # 性能优化：预处理配置数据
         self.nickname_cache = {}
-        self.monitored_groups_set = set() # 使用集合存储，查找速度 O(1)
+        self.monitored_groups_set = set()
         self.refresh_config_cache()
 
-        # 解析推送时间
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
-        # 启动后台任务
         self.scheduler_task = asyncio.create_task(self.scheduler_loop())
 
     def _parse_push_time(self):
@@ -48,28 +45,34 @@ class ChatMasterPlugin(Star):
                 return h, m
             else:
                 raise ValueError("时间数值越界")
-        # 优化：只捕获特定异常，避免掩盖其他错误
         except (ValueError, IndexError) as e:
             logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 格式不正确 ({e})。已重置为 09:00")
             return 9, 0
 
     def refresh_config_cache(self):
-        """刷新配置缓存 (昵称映射 & 监控群组)"""
-        # 1. 处理昵称映射 (白名单)
+        """刷新配置缓存"""
+        # 1. 优化配置解析逻辑：智能处理中文冒号，不误伤昵称内容
         mapping = {}
         raw_list = self.config.get("nickname_mapping", [])
         if raw_list:
             for item in raw_list:
-                item_str = str(item).replace("：", ":")
+                item_str = str(item)
+                parts = []
+                
+                # 优先尝试英文冒号分割
                 if ":" in item_str:
                     parts = item_str.split(":", 1)
-                    if len(parts) == 2:
-                        qq = parts[0].strip()
-                        name = parts[1].strip()
-                        mapping[qq] = name
+                # 其次尝试中文冒号分割
+                elif "：" in item_str:
+                    parts = item_str.split("：", 1)
+                
+                if len(parts) == 2:
+                    qq = parts[0].strip()
+                    name = parts[1].strip()
+                    mapping[qq] = name
         self.nickname_cache = mapping
 
-        # 2. 处理监控群组 (转为字符串集合，提升 on_message 性能)
+        # 2. 处理监控群组
         raw_groups = self.config.get("monitored_groups", [])
         self.monitored_groups_set = set(str(g) for g in raw_groups)
 
@@ -99,28 +102,25 @@ class ChatMasterPlugin(Star):
             logger.error(f"ChatMaster 保存数据失败: {e}")
 
     def terminate(self):
-        """插件卸载生命周期"""
         if self.scheduler_task:
             self.scheduler_task.cancel()
         self.save_data()
         logger.info("ChatMaster 插件已停止，数据已保存。")
 
-    @astr_filter.event_message_type(astr_filter.EventMessageType.GROUP_MESSAGE)
+    # 3. 使用显式导入的 EventMessageType
+    @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
-        """消息处理：热点路径，必须高效"""
         message_obj = event.message_obj
         if not message_obj.group_id:
             return
 
-        # 转换为字符串以匹配配置
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
         
-        # 优化：使用预处理的集合进行 O(1) 查找，不再每次消息都遍历列表
         if group_id not in self.monitored_groups_set:
             return
 
-        # 逻辑说明：保留白名单模式 (用户明确要求仅记录配置了昵称的用户)
+        # 坚持白名单逻辑：仅记录配置了昵称的用户
         if user_id not in self.nickname_cache:
             return 
 
@@ -172,7 +172,6 @@ class ChatMasterPlugin(Star):
             try:
                 await self.check_schedule()
                 
-                # 优化：使用常量控制保存间隔
                 if self.data_changed and (time.time() - self.last_save_time > self.SAVE_INTERVAL):
                     self.save_data()
                     
@@ -181,7 +180,6 @@ class ChatMasterPlugin(Star):
             except Exception as e:
                 logger.error(f"ChatMaster 调度出错: {e}")
             
-            # 优化：使用常量控制检查间隔
             await asyncio.sleep(self.CHECK_INTERVAL)
 
     async def check_schedule(self):
@@ -203,8 +201,8 @@ class ChatMasterPlugin(Star):
             await self.run_inspection()
 
     async def run_inspection(self):
-        # 这里还是读取配置，防止配置热更新后 monitors 没变 (虽然 AstrBot 通常会重载插件)
-        monitored_groups = self.config.get("monitored_groups", [])
+        # 重新读取配置，支持热重载
+        self.refresh_config_cache()
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
         timeout_seconds = timeout_days_cfg * 24 * 3600
         template = self.config.get("alert_template", "“{nickname}”已经“{days}”天没发言了")
@@ -212,9 +210,8 @@ class ChatMasterPlugin(Star):
 
         logger.info(f"ChatMaster: === 开始执行活跃度检测 (阈值: {timeout_days_cfg}天) ===")
 
-        for group_id in monitored_groups:
+        for group_id in self.monitored_groups_set:
             try:
-                group_id = str(group_id)
                 group_data = self.data["groups"].get(group_id, {})
                 
                 if not group_data:
@@ -244,10 +241,22 @@ class ChatMasterPlugin(Star):
                 if msg_list:
                     logger.info(f"ChatMaster: -> 群 {group_id} 结果: 需推送。共发现 {len(msg_list)} 人。")
                     final_msg = "\n".join(msg_list)
-                    await self.context.send_message(
-                        target_group_id=group_id, 
-                        message_str=f"📢 潜水员日报：\n{final_msg}"
-                    )
+                    
+                    # 4. 增加网络重试机制
+                    for attempt in range(self.MAX_RETRIES):
+                        try:
+                            await self.context.send_message(
+                                target_group_id=group_id, 
+                                message_str=f"📢 潜水员日报：\n{final_msg}"
+                            )
+                            break # 发送成功，跳出重试循环
+                        except Exception as e:
+                            if attempt == self.MAX_RETRIES - 1:
+                                logger.error(f"ChatMaster: 群 {group_id} 推送失败，已达到最大重试次数: {e}")
+                            else:
+                                logger.warning(f"ChatMaster: 群 {group_id} 推送失败，1秒后重试 ({attempt+1}/{self.MAX_RETRIES})")
+                                await asyncio.sleep(1)
+                                
                     await asyncio.sleep(2)
                 else:
                     logger.info(f"ChatMaster: -> 群 {group_id} 结果: 无需推送。")
