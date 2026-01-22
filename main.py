@@ -175,7 +175,7 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
-    # 🛠️ 修复点1：增加 *args, **kwargs 接收所有多余参数
+    # 🛠️ 关键修复：添加 *args, **kwargs 以接收多余参数
     @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent, *args, **kwargs):
         message_obj = event.message_obj
@@ -199,7 +199,7 @@ class ChatMasterPlugin(Star):
         self.data["groups"][group_id][user_id] = time.time()
         self.data_changed = True 
 
-    # 🛠️ 修复点2：增加 *args, **kwargs 接收所有多余参数
+    # 🛠️ 关键修复：添加 *args, **kwargs 以接收多余参数
     @astr_filter.command("聊天检测")
     async def manual_check(self, event: AstrMessageEvent, *args, **kwargs):
         message_obj = event.message_obj
