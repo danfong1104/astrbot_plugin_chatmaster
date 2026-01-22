@@ -7,11 +7,13 @@ import tempfile
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
+# 1. 导入 StarTools 用于获取标准数据路径
 from astrbot.api.all import *
 from astrbot.api.event import filter
 from astrbot.api import logger
+from astrbot.api.star import StarTools
 
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.1.0")
+# 2. 移除 @register 装饰器 (官方已废弃，框架会自动识别 Star 子类)
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300       # 自动保存间隔
     CHECK_INTERVAL = 60       # 检查循环间隔
@@ -27,8 +29,14 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
-        self.data_dir = os.path.dirname(__file__)
+        # 3. 修复数据路径：使用 StarTools 获取标准存储位置
+        # 这能避免容器化部署时数据丢失，且解决了权限问题
+        self.data_dir = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = os.path.join(self.data_dir, "data.json")
+        
+        # 确保目录存在
+        if not os.path.exists(self.data_dir):
+            os.makedirs(self.data_dir, exist_ok=True)
         
         self.data = self.load_data()
         
@@ -38,6 +46,9 @@ class ChatMasterPlugin(Star):
         self.enable_whitelist_global = True
         self.enable_mapping = True
         
+        # 调度器状态锁，防止同一分钟重复执行
+        self.last_processed_minute = -1
+        
         # 初始化配置
         self.refresh_config_cache()
         self.push_time_h, self.push_time_m = self._parse_push_time()
@@ -45,7 +56,8 @@ class ChatMasterPlugin(Star):
         # 启动提示
         server_time = datetime.now().strftime("%H:%M")
         last_run = self.data.get("global_last_run_date", "无记录")
-        logger.info(f"ChatMaster v2.1.0 已加载。")
+        logger.info(f"ChatMaster v2.1.0 已加载 (Audit Fix)。")
+        logger.info(f" -> 数据路径: {self.data_file}")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
         logger.info(f" -> 上次运行日期: {last_run}")
@@ -129,6 +141,7 @@ class ChatMasterPlugin(Star):
     def _save_data_atomic(self, data_snapshot: Dict[str, Any]):
         temp_path = None
         try:
+            # 4. 优化：在 data_dir 下创建临时文件，避免跨卷移动导致的权限问题
             fd, temp_path = tempfile.mkstemp(dir=self.data_dir, text=True)
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data_snapshot, f, ensure_ascii=False, indent=2)
@@ -283,16 +296,27 @@ class ChatMasterPlugin(Star):
         current_minutes = now.hour * 60 + now.minute
         target_minutes = target_h * 60 + target_m
         
-        is_time_up = current_minutes >= target_minutes
-        in_window = (current_minutes - target_minutes) <= (self.CATCH_UP_WINDOW * 60)
-        is_exact_minute = (current_minutes == target_minutes)
+        # 5. 修复调度逻辑：使用状态锁防止重复执行，移除 now.second < 10 的脆弱判断
+        # 如果这一分钟已经处理过，直接跳过
+        if current_minutes == self.last_processed_minute:
+            return
         
+        # 更新状态锁
+        self.last_processed_minute = current_minutes
+        
+        is_time_up = (current_minutes == target_minutes)
+        in_window = (current_minutes - target_minutes) <= (self.CATCH_UP_WINDOW * 60)
+        
+        # 如果机器人启动时已经过了时间，但还在窗口期内，也视为“时间到了”
+        if current_minutes > target_minutes and in_window:
+            is_time_up = True
+
         last_run = self.data.get("global_last_run_date", "")
         
-        # 场景1：正常触发 (时间到 + 没跑过 + 在窗口期)
+        # 逻辑分支1：今天没跑过 -> 正常推送
         if is_time_up and last_run != today_date_str:
             if in_window:
-                logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d} (今日首次)，开始执行任务...")
+                logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d} (今日首次)，执行任务...")
                 await self.run_inspection(send_message=True)
             else:
                 logger.warning(f"ChatMaster: 错过推送时间（>{self.CATCH_UP_WINDOW}h），今日不补发。")
@@ -302,12 +326,10 @@ class ChatMasterPlugin(Star):
             await self.save_data()
             return
 
-        # 场景2：整点后台自检 (时间正好 + 已经跑过) -> 明确告知原因：[今日已推送]
-        if is_exact_minute and last_run == today_date_str:
-            # 只有在秒数较小时打印一次，避免一分钟内重复刷日志
-            if now.second < 10:
-                logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d} (今日已执行过)，执行后台自检...")
-                await self.run_inspection(send_message=False)
+        # 逻辑分支2：今天跑过了，但正好是那个整点 -> 打印后台日志告知原因
+        if current_minutes == target_minutes and last_run == today_date_str:
+            logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d} (今日已执行过)，执行后台自检...")
+            await self.run_inspection(send_message=False)
 
     async def run_inspection(self, send_message: bool = True):
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
@@ -316,21 +338,16 @@ class ChatMasterPlugin(Star):
         now_ts = time.time()
 
         if not self.monitored_groups_set:
-            logger.warning("ChatMaster: 未配置监控群组 (monitored_groups为空)。")
             return
 
-        # ---------------------------------------------------------
-        #  日志聚合优化：每个群组只输出一条完整的日志块，而不是分散的行
-        # ---------------------------------------------------------
         for group_id in self.monitored_groups_set:
             try:
                 group_data = self.data["groups"].get(group_id, {})
                 use_whitelist = self._is_group_whitelist_mode(group_id)
                 mode_str = "白名单" if use_whitelist else "全员"
                 
-                # 初始化日志缓冲列表
                 log_lines = []
-                log_lines.append(f"ChatMaster: 正在检测群 {group_id} [{mode_str}模式]...")
+                log_lines.append(f"ChatMaster: 检测群 {group_id} [{mode_str}]...")
 
                 if not group_data:
                     log_lines.append("  -> 暂无活跃数据。")
@@ -365,17 +382,15 @@ class ChatMasterPlugin(Star):
                     else:
                         active_names.append(nickname)
                 
-                # 汇总活跃/潜水情况到日志
                 if active_names:
                     log_lines.append(f"  🟢 活跃人员 ({len(active_names)}): {', '.join(active_names)}")
                 if inactive_names:
                     log_lines.append(f"  🔴 潜水人员 ({len(inactive_names)}): {', '.join(inactive_names)}")
 
-                # 核心逻辑：明确不发送的原因
                 if msg_list:
                     if send_message:
                         log_lines.append(f"  -> 结论: ❌ 发现 {len(msg_list)} 人潜水，正在推送...")
-                        logger.info("\n".join(log_lines)) # 先打印日志，再发送消息
+                        logger.info("\n".join(log_lines))
                         
                         final_msg = "\n".join(msg_list)
                         for attempt in range(self.MAX_RETRIES):
@@ -392,7 +407,6 @@ class ChatMasterPlugin(Star):
                                     await asyncio.sleep(1)
                         await asyncio.sleep(2)
                     else:
-                        # 明确原因：今日已推过
                         log_lines.append(f"  -> 结论: ⚠️ 发现潜水人员，但 [今日已推送过] (拦截发送)。")
                         logger.info("\n".join(log_lines))
                 else:
