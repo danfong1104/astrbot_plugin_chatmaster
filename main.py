@@ -8,9 +8,9 @@ from typing import Dict, Any, Tuple
 from astrbot.api.all import Context, AstrMessageEvent, Star, register
 from astrbot.api import logger
 from astrbot.api.star import StarTools
-from astrbot.api.event import filter as astr_filter, EventMessageType
+from astrbot.api.event import filter as astr_filter  # 修正导入方式
 
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.0")
+@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.1")
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300
     CHECK_INTERVAL = 60
@@ -29,7 +29,7 @@ class ChatMasterPlugin(Star):
         
         self.nickname_cache = {}
         self.monitored_groups_set = set()
-        self.exception_groups_set = set() # 例外群组缓存
+        self.exception_groups_set = set()
         self.enable_whitelist_global = True
         self.enable_mapping = True
         
@@ -56,19 +56,15 @@ class ChatMasterPlugin(Star):
 
     def refresh_config_cache(self):
         """刷新配置缓存"""
-        # 开关与列表
         self.enable_whitelist_global = self.config.get("enable_whitelist", True)
         self.enable_mapping = self.config.get("enable_nickname_mapping", True)
         
-        # 监控群组
         raw_groups = self.config.get("monitored_groups", [])
         self.monitored_groups_set = set(str(g) for g in raw_groups)
         
-        # 例外群组
         raw_exceptions = self.config.get("whitelist_exception_groups", [])
         self.exception_groups_set = set(str(g) for g in raw_exceptions)
 
-        # 昵称映射
         mapping = {}
         raw_list = self.config.get("nickname_mapping", [])
         if raw_list:
@@ -88,13 +84,9 @@ class ChatMasterPlugin(Star):
 
     def _is_group_whitelist_mode(self, group_id: str) -> bool:
         """判断指定群是否开启了白名单模式"""
-        # 默认使用全局设置
         mode = self.enable_whitelist_global
-        
-        # 如果该群在例外列表中，则取反
         if group_id in self.exception_groups_set:
             mode = not mode
-            
         return mode
 
     def load_data(self) -> Dict[str, Any]:
@@ -147,7 +139,8 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
-    @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
+    # 修正调用方式：使用 astr_filter.EventMessageType
+    @astr_filter.event_message_type(astr_filter.EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
         message_obj = event.message_obj
         if not message_obj.group_id:
@@ -156,18 +149,14 @@ class ChatMasterPlugin(Star):
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
         
-        # 1. 必须在总监控名单里
         if group_id not in self.monitored_groups_set:
             return
 
-        # 2. 判断该群的白名单策略
         use_whitelist = self._is_group_whitelist_mode(group_id)
         
-        # 如果该群开启白名单，且用户不在名单内 -> 忽略
         if use_whitelist and user_id not in self.nickname_cache:
             return 
         
-        # 否则（全员模式 或 用户在名单内）-> 记录
         if group_id not in self.data["groups"]:
             self.data["groups"][group_id] = {}
 
@@ -195,13 +184,11 @@ class ChatMasterPlugin(Star):
         
         self.refresh_config_cache()
         
-        # 获取当前群的模式
         use_whitelist = self._is_group_whitelist_mode(group_id)
         mode_str = "白名单模式" if use_whitelist else "全员监控模式"
         msg_lines.append(f"当前模式: {mode_str}")
         
         for user_id, last_seen_ts in group_data.items():
-            # 过滤展示
             if use_whitelist and user_id not in self.nickname_cache:
                 continue
                 
@@ -269,13 +256,10 @@ class ChatMasterPlugin(Star):
                 if not group_data:
                     continue
 
-                # 判断该群模式
                 use_whitelist = self._is_group_whitelist_mode(group_id)
-
                 msg_list = []
                 
                 for user_id, last_seen_ts in group_data.items():
-                    # 过滤逻辑
                     if use_whitelist and user_id not in self.nickname_cache:
                         continue
                     
