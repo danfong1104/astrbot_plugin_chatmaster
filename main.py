@@ -175,8 +175,9 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
+    # 🛠️ 修复点1：增加 *args, **kwargs 接收所有多余参数
     @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
-    async def on_message(self, event: AstrMessageEvent):
+    async def on_message(self, event: AstrMessageEvent, *args, **kwargs):
         message_obj = event.message_obj
         if not message_obj.group_id or not message_obj.sender:
             return
@@ -198,9 +199,9 @@ class ChatMasterPlugin(Star):
         self.data["groups"][group_id][user_id] = time.time()
         self.data_changed = True 
 
-    # 🛠️ 修复点：增加 *args 接收所有多余参数，防止 TypeError
+    # 🛠️ 修复点2：增加 *args, **kwargs 接收所有多余参数
     @astr_filter.command("聊天检测")
-    async def manual_check(self, event: AstrMessageEvent, *args):
+    async def manual_check(self, event: AstrMessageEvent, *args, **kwargs):
         message_obj = event.message_obj
         if not message_obj.group_id:
             yield event.plain_result("🚫 请在群聊中使用此命令。")
