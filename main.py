@@ -1,81 +1,92 @@
-import os
 import json
 import time
 import asyncio
 from datetime import datetime
 from astrbot.api.all import *
+from astrbot.api import logger  # 1. 修复：使用官方标准的日志工具
+from astrbot.api.star import StarTools # 2. 修复：使用官方数据目录管理
 from astrbot.api.event import filter
 
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "1.2.5")
+@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "1.3.0")
 class ChatMasterPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
+        self.data_changed = False # 标记数据是否发生变化
         
-        self.data_file = os.path.join(os.path.dirname(__file__), "data.json")
+        # 3. 修复：使用 StarTools 获取规范的数据存储路径
+        self.data_dir = StarTools.get_data_dir("astrbot_plugin_chatmaster")
+        self.data_file = self.data_dir / "data.json" # Path对象拼接
+        
         self.data = self.load_data()
         
-        asyncio.create_task(self.scheduler_loop())
+        # 4. 优化：预处理白名单，将列表转换为字典，极大提升查询速度 (O(N) -> O(1))
+        self.nickname_cache = {}
+        self.refresh_nickname_cache()
+        
+        # 5. 修复：保存任务引用，防止变成“幽灵任务”
+        self.scheduler_task = asyncio.create_task(self.scheduler_loop())
+
+    def refresh_nickname_cache(self):
+        """将配置的列表转换为字典，方便快速查找"""
+        mapping = {}
+        raw_list = self.config.get("nickname_mapping", [])
+        if raw_list:
+            for item in raw_list:
+                # 增强健壮性：处理可能的格式问题
+                item_str = str(item).replace("：", ":")
+                if ":" in item_str:
+                    parts = item_str.split(":", 1)
+                    if len(parts) == 2:
+                        qq = parts[0].strip()
+                        name = parts[1].strip()
+                        mapping[qq] = name
+        self.nickname_cache = mapping
 
     def load_data(self):
+        """加载数据"""
         default_data = {"global_last_run_date": "", "groups": {}}
-        if not os.path.exists(self.data_file):
+        
+        # 检查文件是否存在
+        if not self.data_file.exists():
             return default_data
+        
         try:
             with open(self.data_file, 'r', encoding='utf-8') as f:
                 loaded = json.load(f)
                 if loaded and "global_last_run_date" not in loaded:
                     return {"global_last_run_date": "", "groups": loaded}
                 return loaded
-        except:
+        except Exception as e:
+            logger.error(f"ChatMaster 加载数据失败: {e}")
             return default_data
 
     def save_data(self):
+        """保存数据到磁盘"""
+        # 性能优化：只有数据确实改变了才写入磁盘
+        if not self.data_changed:
+            return
+
         try:
             with open(self.data_file, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
+            self.data_changed = False # 重置标记
+            # logger.debug("ChatMaster 数据已保存") 
         except Exception as e:
-            self.context.logger.error(f"ChatMaster 保存数据失败: {e}")
+            logger.error(f"ChatMaster 保存数据失败: {e}")
 
-    def is_user_allowed(self, user_id):
-        """检查用户是否在白名单（昵称映射表）中"""
-        user_id_str = str(user_id)
-        mapping_list = self.config.get("nickname_mapping", [])
-        
-        if not mapping_list:
-            return False
-
-        for item in mapping_list:
-            item_str = str(item).replace("：", ":")
-            if ":" in item_str:
-                parts = item_str.split(":", 1)
-                if len(parts) == 2:
-                    qq_cfg = parts[0].strip()
-                    if qq_cfg == user_id_str:
-                        return True
-        return False
-
-    def get_nickname(self, user_id):
-        """从配置列表 'QQ:昵称' 中解析昵称"""
-        user_id_str = str(user_id)
-        mapping_list = self.config.get("nickname_mapping", [])
-        
-        if not mapping_list:
-            return f"用户{user_id_str}"
-
-        for item in mapping_list:
-            item_str = str(item).replace("：", ":")
-            if ":" in item_str:
-                parts = item_str.split(":", 1)
-                if len(parts) == 2:
-                    qq_cfg, name_cfg = parts
-                    if qq_cfg.strip() == user_id_str:
-                        return name_cfg.strip()
-        
-        return f"用户{user_id_str}"
+    def terminate(self):
+        """生命周期钩子：插件卸载/关闭时调用"""
+        # 取消后台任务
+        if self.scheduler_task:
+            self.scheduler_task.cancel()
+        # 强制保存一次数据
+        self.save_data()
+        logger.info("ChatMaster 插件已停止，数据已保存。")
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
+        """监听消息：仅更新内存数据，不写硬盘"""
         message_obj = event.message_obj
         if not message_obj.group_id:
             return
@@ -83,20 +94,22 @@ class ChatMasterPlugin(Star):
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
         
-        # 1. 检查群是否在监控列表
+        # 检查群
         monitored_groups = self.config.get("monitored_groups", [])
         if monitored_groups and group_id not in monitored_groups:
             return
 
-        # 2. 检查用户是否在昵称白名单里
-        if not self.is_user_allowed(user_id):
+        # 优化：O(1) 极速检查用户是否在白名单
+        if user_id not in self.nickname_cache:
             return 
 
         if group_id not in self.data["groups"]:
             self.data["groups"][group_id] = {}
 
+        # 仅更新内存中的时间戳
         self.data["groups"][group_id][user_id] = time.time()
-        self.save_data()
+        # 标记数据已变脏，等待定时任务去保存
+        self.data_changed = True 
 
     @filter.command("聊天检测")
     async def manual_check(self, event: AstrMessageEvent):
@@ -118,10 +131,11 @@ class ChatMasterPlugin(Star):
         count = 0
         
         for user_id, last_seen_ts in group_data.items():
-            if not self.is_user_allowed(user_id):
+            # 使用缓存的字典直接获取昵称
+            nickname = self.nickname_cache.get(user_id)
+            if not nickname:
                 continue
                 
-            nickname = self.get_nickname(user_id)
             last_seen_dt = datetime.fromtimestamp(last_seen_ts)
             last_seen_str = last_seen_dt.strftime('%Y-%m-%d %H:%M:%S')
             
@@ -132,15 +146,26 @@ class ChatMasterPlugin(Star):
             msg_lines.append(f"{status_emoji} {nickname} | 未发言: {days}天 | 最后: {last_seen_str}")
             count += 1
 
-        msg_lines.append(f"\n共记录 {count} 人（仅统计白名单用户）。")
+        msg_lines.append(f"\n共记录 {count} 人。")
         yield event.plain_result("\n".join(msg_lines))
 
     async def scheduler_loop(self):
+        """后台调度循环"""
         while True:
             try:
+                # 1. 检查推送时间
                 await self.check_schedule()
+                
+                # 2. 定期保存数据 (每分钟检查一次是否需要保存)
+                # 这样既保证了数据安全，又避免了高频IO
+                self.save_data()
+                
+            except asyncio.CancelledError:
+                # 任务被取消时退出循环
+                break
             except Exception as e:
-                self.context.logger.error(f"ChatMaster 调度出错: {e}")
+                logger.error(f"ChatMaster 调度出错: {e}")
+            
             await asyncio.sleep(60)
 
     async def check_schedule(self):
@@ -158,11 +183,11 @@ class ChatMasterPlugin(Star):
         last_run = self.data.get("global_last_run_date", "")
         
         if is_time_up and last_run != today_date_str:
-            # 这里的日志只在确实触发时打印一次
-            self.context.logger.info(f"ChatMaster: 到达设定时间 {push_time_str}，触发每日检测...")
+            logger.info(f"ChatMaster: 到达设定时间 {push_time_str}，触发每日检测...")
             await self.run_inspection()
             self.data["global_last_run_date"] = today_date_str
-            self.save_data()
+            self.data_changed = True # 标记需要保存
+            self.save_data() # 立即保存一次状态
 
     async def run_inspection(self):
         monitored_groups = self.config.get("monitored_groups", [])
@@ -171,31 +196,25 @@ class ChatMasterPlugin(Star):
         template = self.config.get("alert_template", "“{nickname}”已经“{days}”天没发言了")
         now_ts = time.time()
 
-        self.context.logger.info(f"ChatMaster: === 开始执行活跃度检测 (阈值: {timeout_days_cfg}天) ===")
+        logger.info(f"ChatMaster: === 开始执行活跃度检测 (阈值: {timeout_days_cfg}天) ===")
 
         for group_id in monitored_groups:
             group_id = str(group_id)
             group_data = self.data["groups"].get(group_id, {})
             
-            # 打印正在检测哪个群
-            self.context.logger.info(f"ChatMaster: 正在检测群 {group_id} ...")
-
             if not group_data:
-                self.context.logger.info(f"ChatMaster: -> 群 {group_id} 暂无数据，跳过。")
                 continue
 
             msg_list = []
-            checked_count = 0
             
             for user_id, last_seen_ts in group_data.items():
-                if not self.is_user_allowed(user_id):
+                nickname = self.nickname_cache.get(user_id)
+                if not nickname:
                     continue
                 
-                checked_count += 1
                 time_diff = now_ts - last_seen_ts
                 
                 if time_diff >= timeout_seconds:
-                    nickname = self.get_nickname(user_id)
                     days_silent = int(time_diff // 86400)
                     last_seen_str = datetime.fromtimestamp(last_seen_ts).strftime('%Y-%m-%d %H:%M:%S')
                     
@@ -205,11 +224,10 @@ class ChatMasterPlugin(Star):
                         last_seen=last_seen_str
                     )
                     msg_list.append(line)
-                    # 打印单条命中日志
-                    self.context.logger.info(f"ChatMaster:   -> 发现潜水员: {nickname} (未发言 {days_silent} 天)")
+                    logger.info(f"ChatMaster:   -> 发现潜水员: {nickname} (未发言 {days_silent} 天)")
             
             if msg_list:
-                self.context.logger.info(f"ChatMaster: -> 结果: 需推送。共发现 {len(msg_list)} 人。")
+                logger.info(f"ChatMaster: -> 群 {group_id} 结果: 需推送。共发现 {len(msg_list)} 人。")
                 final_msg = "\n".join(msg_list)
                 await self.context.send_message(
                     target_group_id=group_id, 
@@ -217,6 +235,4 @@ class ChatMasterPlugin(Star):
                 )
                 await asyncio.sleep(2)
             else:
-                self.context.logger.info(f"ChatMaster: -> 结果: 无需推送 (检测了 {checked_count} 个白名单用户，均活跃)。")
-        
-        self.context.logger.info(f"ChatMaster: === 检测结束 ===")
+                logger.info(f"ChatMaster: -> 群 {group_id} 结果: 无需推送。")
