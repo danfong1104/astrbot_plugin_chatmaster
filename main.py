@@ -5,20 +5,18 @@ import copy
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
-# 1. 关键修复：直接从 api.all 导入 EventMessageType，这是最安全的路径
-from astrbot.api.all import Context, AstrMessageEvent, Star, EventMessageType
+from astrbot.api.all import Context, AstrMessageEvent, Star
 from astrbot.api import logger
 from astrbot.api.star import StarTools
-# 2. 这里的导入只保留 filter
-from astrbot.api.event import filter as astr_filter
+from astrbot.api.event import filter as astr_filter, EventMessageType
 
 class ChatMasterPlugin(Star):
-    SAVE_INTERVAL = 300       # 自动保存间隔 (秒)
-    CHECK_INTERVAL = 60       # 检查循环间隔 (秒)
-    CLEANUP_INTERVAL = 86400  # 强制清理间隔 (24小时)
+    SAVE_INTERVAL = 300       # 自动保存间隔
+    CHECK_INTERVAL = 60       # 检查循环间隔
+    CLEANUP_INTERVAL = 86400  # 强制清理间隔
     MAX_RETRIES = 3           # 推送重试次数
-    CATCH_UP_WINDOW = 3       # 补发窗口 (小时)
-    CLEANUP_DAYS = 90         # 僵尸数据判定阈值 (天)
+    CATCH_UP_WINDOW = 3       # 补发窗口
+    CLEANUP_DAYS = 90         # 僵尸数据阈值
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -40,14 +38,13 @@ class ChatMasterPlugin(Star):
         
         # 初始化配置
         self.refresh_config_cache()
-        # 初始化时间解析
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
-        # 启动时提示
+        # 启动提示
         server_time = datetime.now().strftime("%H:%M")
-        logger.info(f"ChatMaster 已加载。当前服务器时间: {server_time}，设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
+        logger.info(f"ChatMaster 已加载。服务器时间: {server_time}，推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
-        # 启动时立即执行一次数据清理
+        # 启动清理
         self._cleanup_old_data()
         
         self.scheduler_task = asyncio.create_task(self.scheduler_loop())
@@ -60,7 +57,7 @@ class ChatMasterPlugin(Star):
             t = datetime.strptime(push_time_str, "%H:%M")
             return t.hour, t.minute
         except ValueError:
-            logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 格式无效 (应为 HH:MM)。已重置为 09:00")
+            logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 格式无效。已重置为 09:00")
             return 9, 0
 
     def refresh_config_cache(self):
@@ -94,13 +91,12 @@ class ChatMasterPlugin(Star):
                             qq = parts[0].strip()
                             name = parts[1].strip()
                             mapping[qq] = name
-                except (ValueError, IndexError, AttributeError) as e:
-                    logger.warning(f"ChatMaster 配置解析警告: 条目 '{item}' 无效 -> {e}")
+                except Exception as e:
+                    logger.warning(f"ChatMaster 配置警告: '{item}' 无效 -> {e}")
                     continue
         self.nickname_cache = mapping
 
     def _is_group_whitelist_mode(self, group_id: str) -> bool:
-        """判断指定群是否开启了白名单模式"""
         mode = self.enable_whitelist_global
         if group_id in self.exception_groups_set:
             mode = not mode
@@ -146,24 +142,19 @@ class ChatMasterPlugin(Star):
             logger.error(f"ChatMaster 异步保存出错: {e}")
 
     def _cleanup_old_data(self):
-        """清理长期未活跃的数据"""
         if not self.data.get("groups"):
             return
-
         cutoff_time = time.time() - (self.CLEANUP_DAYS * 24 * 3600)
         removed_count = 0
-        
         groups_to_check = list(self.data["groups"].keys())
         for group_id in groups_to_check:
             group_data = self.data["groups"][group_id]
             users_to_remove = [uid for uid, ts in group_data.items() if ts < cutoff_time]
-            
             for uid in users_to_remove:
                 del group_data[uid]
                 removed_count += 1
-
         if removed_count > 0:
-            logger.info(f"ChatMaster: 自动清理了 {removed_count} 条超过 {self.CLEANUP_DAYS} 天未活跃的数据。")
+            logger.info(f"ChatMaster: 自动清理了 {removed_count} 条过期数据。")
             self.data_changed = True
 
     def terminate(self):
@@ -177,7 +168,7 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
-    # 3. 修复参数不匹配：添加 *args, **kwargs
+    # 1. on_message: 使用 *args, **kwargs 吸收所有参数
     @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent, *args, **kwargs):
         message_obj = event.message_obj
@@ -191,7 +182,6 @@ class ChatMasterPlugin(Star):
             return
 
         use_whitelist = self._is_group_whitelist_mode(group_id)
-        
         if use_whitelist and user_id not in self.nickname_cache:
             return 
         
@@ -201,9 +191,13 @@ class ChatMasterPlugin(Star):
         self.data["groups"][group_id][user_id] = time.time()
         self.data_changed = True 
 
-    # 4. 修复参数不匹配：添加 *args, **kwargs
+    # 2. manual_check: 核心修复！
+    # 使用带默认值的占位参数 (p1-p10)，既能接收系统塞进来的7个参数，
+    # 又因为都有默认值，会让AstrBot指令解析器认为"没有必填参数"，从而允许直接发送指令。
     @astr_filter.command("聊天检测")
-    async def manual_check(self, event: AstrMessageEvent, *args, **kwargs):
+    async def manual_check(self, event: AstrMessageEvent, 
+                           p1=None, p2=None, p3=None, p4=None, p5=None, 
+                           p6=None, p7=None, p8=None, p9=None, p10=None):
         message_obj = event.message_obj
         if not message_obj.group_id:
             yield event.plain_result("🚫 请在群聊中使用此命令。")
@@ -222,7 +216,6 @@ class ChatMasterPlugin(Star):
         count = 0
         
         self.refresh_config_cache()
-        
         use_whitelist = self._is_group_whitelist_mode(group_id)
         mode_str = "白名单模式" if use_whitelist else "全员监控模式"
         msg_lines.append(f"当前模式: {mode_str}")
@@ -230,9 +223,8 @@ class ChatMasterPlugin(Star):
         for user_id, last_seen_ts in group_data.items():
             if use_whitelist and user_id not in self.nickname_cache:
                 continue
-                
-            nickname = self._get_display_name(user_id)
             
+            nickname = self._get_display_name(user_id)
             last_seen_dt = datetime.fromtimestamp(last_seen_ts)
             last_seen_str = last_seen_dt.strftime('%Y-%m-%d %H:%M:%S')
             
