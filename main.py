@@ -7,14 +7,11 @@ import tempfile
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
-# 1. 回归旧版导入方式，保证兼容性
 from astrbot.api.all import *
 from astrbot.api.event import filter
-# 2. 显式导入全局 logger (解决 AttributeError 崩溃)
 from astrbot.api import logger
 
-# 3. 加回 @register 装饰器 (解决 TypeError 和 参数缺失 的关键！)
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.7")
+@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.8")
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300       # 自动保存间隔
     CHECK_INTERVAL = 60       # 检查循环间隔
@@ -30,7 +27,6 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
-        # 使用旧版稳妥的路径获取
         self.data_dir = os.path.dirname(__file__)
         self.data_file = os.path.join(self.data_dir, "data.json")
         
@@ -46,9 +42,13 @@ class ChatMasterPlugin(Star):
         self.refresh_config_cache()
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
-        # 启动提示 (改用全局 logger)
+        # 启动提示
         server_time = datetime.now().strftime("%H:%M")
-        logger.info(f"ChatMaster v2.0.7 已加载。服务器时间: {server_time}，推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
+        last_run = self.data.get("global_last_run_date", "无记录")
+        logger.info(f"ChatMaster v2.0.8 已加载。")
+        logger.info(f" -> 服务器时间: {server_time}")
+        logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
+        logger.info(f" -> 上次运行日期: {last_run} (如果是今天，则今日不再自动推送)")
 
         # 启动后台任务
         self.cleanup_task = asyncio.create_task(self._cleanup_old_data_async())
@@ -61,7 +61,6 @@ class ChatMasterPlugin(Star):
             t = datetime.strptime(push_time_str, "%H:%M")
             return t.hour, t.minute
         except ValueError:
-            # 修复：使用全局 logger
             logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 格式无效。已重置为 09:00")
             return 9, 0
 
@@ -182,7 +181,6 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
-    # 4. 回归旧版签名 (无 *args)，配合 @register 使用
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
         message_obj = event.message_obj
@@ -205,8 +203,6 @@ class ChatMasterPlugin(Star):
         self.data["groups"][group_id][user_id] = time.time()
         self.data_changed = True 
 
-    # 5. 回归旧版签名 (无 *args)，配合 @register 使用
-    # 彻底解决 "必要参数缺失" 和 "参数过多" 的报错
     @filter.command("聊天检测")
     async def manual_check(self, event: AstrMessageEvent):
         message_obj = event.message_obj
@@ -280,17 +276,24 @@ class ChatMasterPlugin(Star):
         current_minutes = now.hour * 60 + now.minute
         target_minutes = target_h * 60 + target_m
         
+        # 宽容度检查，确保不会因为秒数差异而错过
         is_time_up = current_minutes >= target_minutes
         in_window = (current_minutes - target_minutes) <= (self.CATCH_UP_WINDOW * 60)
         
         last_run = self.data.get("global_last_run_date", "")
         
+        # 调试日志：如果时间匹配但未执行，打印原因
+        if is_time_up and last_run == today_date_str:
+            # 这里的日志可以帮助你确认插件还在活着，但为了不刷屏，你可以注释掉
+            # logger.debug("ChatMaster: 已到达推送时间，但今日已执行过。")
+            pass
+
         if is_time_up and last_run != today_date_str:
             if in_window:
-                logger.info(f"ChatMaster: 到达推送窗口 {target_h:02d}:{target_m:02d}，执行任务...")
+                logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d}，开始执行检测任务...")
                 await self.run_inspection()
             else:
-                logger.warning(f"ChatMaster: 错过推送时间（>{self.CATCH_UP_WINDOW}h），今日不补发。")
+                logger.warning(f"ChatMaster: 错过推送时间（已过 {self.CATCH_UP_WINDOW} 小时窗口），今日不再补发。")
             
             self.data["global_last_run_date"] = today_date_str
             self.data_changed = True
@@ -302,16 +305,27 @@ class ChatMasterPlugin(Star):
         template = self.config.get("alert_template", "“{nickname}”已经“{days}”天没发言了")
         now_ts = time.time()
 
-        logger.info(f"ChatMaster: === 开始执行活跃度检测 (阈值: {timeout_days_cfg}天) ===")
+        logger.info(f"ChatMaster: === 开始日报自检 (阈值: {timeout_days_cfg}天) ===")
+
+        if not self.monitored_groups_set:
+            logger.warning("ChatMaster: 未配置监控群组 (monitored_groups为空)，无法执行检测。")
+            return
 
         for group_id in self.monitored_groups_set:
             try:
                 group_data = self.data["groups"].get(group_id, {})
+                use_whitelist = self._is_group_whitelist_mode(group_id)
+                mode_str = "白名单" if use_whitelist else "全员"
+
+                logger.info(f"ChatMaster: 正在检测群 {group_id} [{mode_str}模式]...")
+                
                 if not group_data:
+                    logger.info(f"ChatMaster: -> 群 {group_id} 暂无任何活跃数据。")
                     continue
 
-                use_whitelist = self._is_group_whitelist_mode(group_id)
                 msg_list = []
+                active_list = []   # 记录活跃用户
+                inactive_list = [] # 记录潜水用户
                 
                 user_items = list(group_data.items())
                 for i, (user_id, last_seen_ts) in enumerate(user_items):
@@ -320,10 +334,10 @@ class ChatMasterPlugin(Star):
                     if use_whitelist and user_id not in self.nickname_cache:
                         continue
                     
+                    nickname = self._get_display_name(user_id)
                     time_diff = now_ts - last_seen_ts
                     
                     if time_diff >= timeout_seconds:
-                        nickname = self._get_display_name(user_id)
                         days_silent = int(time_diff // 86400)
                         last_seen_str = datetime.fromtimestamp(last_seen_ts).strftime('%Y-%m-%d %H:%M:%S')
                         
@@ -333,22 +347,37 @@ class ChatMasterPlugin(Star):
                             last_seen=last_seen_str
                         )
                         msg_list.append(line)
-                        logger.info(f"ChatMaster:   -> 发现潜水员: {nickname} (未发言 {days_silent} 天)")
+                        inactive_list.append(f"{nickname}({days_silent}天)")
+                    else:
+                        active_list.append(nickname)
                 
+                # 核心需求：无论是否推送，都要打印监控名单
+                if active_list:
+                    logger.info(f"ChatMaster:   🟢 活跃人员 ({len(active_list)}): {', '.join(active_list)}")
+                if inactive_list:
+                    logger.info(f"ChatMaster:   🔴 潜水人员 ({len(inactive_list)}): {', '.join(inactive_list)}")
+
                 if msg_list:
-                    logger.info(f"ChatMaster: -> 群 {group_id} 结果: 需推送。共发现 {len(msg_list)} 人。")
+                    logger.info(f"ChatMaster: -> 结论: ❌ 发现 {len(msg_list)} 人潜水，正在推送...")
                     final_msg = "\n".join(msg_list)
                     for attempt in range(self.MAX_RETRIES):
                         try:
-                            await self.context.send_message(target_group_id=group_id, message_str=f"📢 潜水员日报：\n{final_msg}")
+                            await self.context.send_message(
+                                target_group_id=group_id, 
+                                message_str=f"📢 潜水员日报：\n{final_msg}"
+                            )
                             break 
                         except Exception as e:
-                            if attempt == self.MAX_RETRIES - 1: logger.error(f"ChatMaster: 群 {group_id} 推送失败: {e}")
-                            else: await asyncio.sleep(1)
+                            if attempt == self.MAX_RETRIES - 1:
+                                logger.error(f"ChatMaster: 群 {group_id} 推送失败: {e}")
+                            else:
+                                await asyncio.sleep(1)
                     await asyncio.sleep(2)
                 else:
-                    logger.info(f"ChatMaster: -> 群 {group_id} 结果: 无需推送。")
+                    logger.info(f"ChatMaster: -> 结论: ✅ 全员活跃，无需推送。")
 
             except Exception as e:
                 logger.error(f"ChatMaster: 处理群 {group_id} 时发生错误: {e}")
                 continue
+        
+        logger.info("ChatMaster: === 日报检测结束 ===")
