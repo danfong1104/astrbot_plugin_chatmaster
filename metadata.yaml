@@ -1,5 +1,5 @@
 name: astrbot_plugin_chatmaster
-version: 1.2.5
+version: 1.3.0
 author: danfong1104
 desc: 检测群友活跃度的插件，支持群友白名单，群友昵称对照转换，群内定时推送等功能
 repo: https://github.com/danfong1104/astrbot_plugin_chatmaster
