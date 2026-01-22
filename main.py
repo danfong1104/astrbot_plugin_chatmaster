@@ -8,6 +8,7 @@ from typing import Dict, Any, Tuple
 from astrbot.api.all import Context, AstrMessageEvent, Star, register
 from astrbot.api import logger
 from astrbot.api.star import StarTools
+# 显式导入 EventMessageType，并正确使用
 from astrbot.api.event import filter as astr_filter, EventMessageType
 
 @register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.1")
@@ -53,8 +54,6 @@ class ChatMasterPlugin(Star):
                     return h, m
             raise ValueError("格式错误")
         except Exception as e:
-            # 仅在配置错误时记录日志，默认返回 09:00
-            # 这里不修改 self 属性，避免副作用
             logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 无效 ({e})。已重置为 09:00")
             return 9, 0
 
@@ -125,11 +124,7 @@ class ChatMasterPlugin(Star):
         if not self.data_changed:
             return
         try:
-            # 关于 copy.deepcopy 阻塞风险的说明：
-            # 为了保证线程安全（避免后台线程写入时 dict 结构发生变化抛出 RuntimeError），
-            # 必须在主线程对数据进行深拷贝快照。
-            # 虽然 deepcopy 是 CPU 密集型操作，但对于通常的群聊活跃度数据（KB至MB级），
-            # 其阻塞时间极短（毫秒级），在保证稳定性的前提下是可以接受的代价。
+            # 深拷贝以确保线程安全，避免后台写入时数据被修改
             data_copy = copy.deepcopy(self.data)
             await asyncio.to_thread(self._save_data_sync, data_copy)
             self.data_changed = False
@@ -148,10 +143,13 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
-    @astr_filter.event_message_type(astr_filter.EventMessageType.GROUP_MESSAGE)
+    # 修复点1：正确使用 EventMessageType.GROUP_MESSAGE，不再通过 astr_filter 调用
+    @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
         message_obj = event.message_obj
-        if not message_obj.group_id:
+        
+        # 修复点2：增加 sender 非空检查
+        if not message_obj.group_id or not message_obj.sender:
             return
 
         group_id = str(message_obj.group_id)
@@ -218,9 +216,8 @@ class ChatMasterPlugin(Star):
     async def scheduler_loop(self):
         while True:
             try:
-                # 刷新配置
                 self.refresh_config_cache()
-                # 解析时间并传递给检查函数，避免副作用
+                # 解析时间并传递
                 target_h, target_m = self._parse_push_time()
                 await self.check_schedule(target_h, target_m)
                 
@@ -235,7 +232,6 @@ class ChatMasterPlugin(Star):
             await asyncio.sleep(self.CHECK_INTERVAL)
 
     async def check_schedule(self, target_h: int, target_m: int):
-        # 使用传递进来的时间参数，不再依赖实例属性
         now = datetime.now()
         today_date_str = now.strftime("%Y-%m-%d")
         
