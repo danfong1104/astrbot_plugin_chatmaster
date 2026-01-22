@@ -8,7 +8,7 @@ from typing import Dict, Any, Tuple
 from astrbot.api.all import Context, AstrMessageEvent, Star, register
 from astrbot.api import logger
 from astrbot.api.star import StarTools
-from astrbot.api.event import filter as astr_filter  # 修正导入方式
+from astrbot.api.event import filter as astr_filter, EventMessageType
 
 @register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.1")
 class ChatMasterPlugin(Star):
@@ -139,8 +139,7 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
-    # 修正调用方式：使用 astr_filter.EventMessageType
-    @astr_filter.event_message_type(astr_filter.EventMessageType.GROUP_MESSAGE)
+    @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
         message_obj = event.message_obj
         if not message_obj.group_id:
