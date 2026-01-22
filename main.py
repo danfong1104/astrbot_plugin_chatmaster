@@ -1,10 +1,10 @@
 import json
 import time
 import asyncio
+import copy # 1. 引入 copy 模块用于深拷贝
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
-# 显式导入，避免命名污染
 from astrbot.api.all import Context, AstrMessageEvent, Star, register
 from astrbot.api import logger
 from astrbot.api.star import StarTools
@@ -12,10 +12,9 @@ from astrbot.api.event import filter as astr_filter, EventMessageType
 
 @register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "1.3.0")
 class ChatMasterPlugin(Star):
-    # 类常量定义
-    SAVE_INTERVAL = 300  # 自动保存间隔 (秒)
-    CHECK_INTERVAL = 60  # 检查循环间隔 (秒)
-    MAX_RETRIES = 3      # 推送重试次数
+    SAVE_INTERVAL = 300
+    CHECK_INTERVAL = 60
+    MAX_RETRIES = 3
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -23,40 +22,40 @@ class ChatMasterPlugin(Star):
         self.data_changed = False 
         self.last_save_time = time.time()
         
-        # 路径处理
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = self.data_dir / "data.json"
         
         self.data = self.load_data()
         
-        # 缓存初始化
         self.nickname_cache = {}
         self.monitored_groups_set = set()
         self.refresh_config_cache()
 
-        # 启动时先解析一次，确保配置无误（同时也为了尽早报错）
         self._parse_push_time()
         
         self.scheduler_task = asyncio.create_task(self.scheduler_loop())
 
     def _parse_push_time(self) -> Tuple[int, int]:
-        """解析并验证推送时间 (支持中文冒号)"""
-        # 每次调用都从 config 获取最新值，支持热重载
+        """解析并验证推送时间"""
         push_time_str = self.config.get("push_time", "09:00")
         push_time_str = push_time_str.replace("：", ":")
         try:
-            h, m = map(int, push_time_str.split(':'))
-            if 0 <= h < 24 and 0 <= m < 60:
-                return h, m
-            else:
-                raise ValueError("时间数值越界")
-        except (ValueError, IndexError) as e:
-            logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 格式不正确 ({e})。已重置为 09:00")
+            # 2. 修复解析逻辑：更健壮的分割处理
+            parts = push_time_str.split(':')
+            if len(parts) >= 2:
+                h = int(parts[0])
+                m = int(parts[1])
+                if 0 <= h < 24 and 0 <= m < 60:
+                    # 更新实例变量供 check_schedule 使用
+                    self.push_time_h, self.push_time_m = h, m
+                    return h, m
+            raise ValueError("时间格式应为 HH:MM")
+        except Exception as e:
+            logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 无效 ({e})。已重置为 09:00")
+            self.push_time_h, self.push_time_m = 9, 0
             return 9, 0
 
     def refresh_config_cache(self):
-        """刷新配置缓存 (支持热重载)"""
-        # 1. 昵称映射 (白名单)
         mapping = {}
         raw_list = self.config.get("nickname_mapping", [])
         if raw_list:
@@ -74,12 +73,10 @@ class ChatMasterPlugin(Star):
                     mapping[qq] = name
         self.nickname_cache = mapping
 
-        # 2. 监控群组 (Set 优化查找)
         raw_groups = self.config.get("monitored_groups", [])
         self.monitored_groups_set = set(str(g) for g in raw_groups)
 
     def load_data(self) -> Dict[str, Any]:
-        """加载数据"""
         default_data = {"global_last_run_date": "", "groups": {}}
         if not self.data_file.exists():
             return default_data
@@ -93,35 +90,37 @@ class ChatMasterPlugin(Star):
             logger.error(f"ChatMaster 加载数据失败: {e}")
             return default_data
 
-    def _save_data_sync(self):
-        """同步保存数据逻辑 (底层实现)"""
-        if not self.data_changed:
-            return
+    def _save_data_sync(self, data_snapshot: Dict[str, Any]):
+        """同步保存数据逻辑 (接收数据快照，线程安全)"""
         try:
             with open(self.data_file, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-            self.data_changed = False
-            self.last_save_time = time.time()
+                json.dump(data_snapshot, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"ChatMaster 保存数据失败: {e}")
 
     async def save_data(self):
-        """异步保存数据 (非阻塞，推荐使用)"""
+        """异步保存数据 (线程安全版)"""
         if not self.data_changed:
             return
         try:
-            # 1. 修复阻塞 I/O：放入线程池执行
-            await asyncio.to_thread(self._save_data_sync)
+            # 3. 核心修复：在主线程创建数据深拷贝
+            # 这确保了传给后台线程的数据不会在写入过程中被 on_message 修改
+            data_copy = copy.deepcopy(self.data)
+            
+            # 将数据快照传给线程
+            await asyncio.to_thread(self._save_data_sync, data_copy)
+            
+            self.data_changed = False
+            self.last_save_time = time.time()
         except Exception as e:
             logger.error(f"ChatMaster 异步保存出错: {e}")
 
     def terminate(self):
-        """插件卸载/关闭时调用"""
         if self.scheduler_task:
             self.scheduler_task.cancel()
         
-        # 4. 安全退出：此处必须使用同步保存，确保进程结束前数据落盘
-        self._save_data_sync()
+        # 退出时使用同步保存，直接传递当前数据
+        self._save_data_sync(self.data)
         logger.info("ChatMaster 插件已停止，数据已保存。")
 
     @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
@@ -133,14 +132,9 @@ class ChatMasterPlugin(Star):
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
         
-        # 刷新缓存（为了更严谨，其实可以在 scheduler 里刷，但为了实时性在这里也可以，
-        # 考虑到 refresh_config_cache 开销极小，且 config 对象通常是内存引用，这里直接用 set 判断即可）
-        # 优化：不在这里频繁刷新，改为在 scheduler 里或 run_inspection 前刷新
-        
         if group_id not in self.monitored_groups_set:
             return
 
-        # 白名单逻辑 (保留)
         if user_id not in self.nickname_cache:
             return 
 
@@ -169,7 +163,6 @@ class ChatMasterPlugin(Star):
         now = time.time()
         count = 0
         
-        # 确保昵称缓存是最新的
         self.refresh_config_cache()
         
         for user_id, last_seen_ts in group_data.items():
@@ -193,11 +186,10 @@ class ChatMasterPlugin(Star):
     async def scheduler_loop(self):
         while True:
             try:
-                # 2. 支持配置热重载：每次循环都重新解析配置和时间
                 self.refresh_config_cache()
+                self._parse_push_time() # 刷新时间配置
                 await self.check_schedule()
                 
-                # 定时自动保存 (异步)
                 if self.data_changed and (time.time() - self.last_save_time > self.SAVE_INTERVAL):
                     await self.save_data()
                     
@@ -212,8 +204,7 @@ class ChatMasterPlugin(Star):
         now = datetime.now()
         today_date_str = now.strftime("%Y-%m-%d")
         
-        # 实时获取最新的推送时间配置
-        target_h, target_m = self._parse_push_time()
+        target_h, target_m = self.push_time_h, self.push_time_m
 
         is_time_up = (now.hour > target_h) or (now.hour == target_h and now.minute >= target_m)
         last_run = self.data.get("global_last_run_date", "")
@@ -223,7 +214,7 @@ class ChatMasterPlugin(Star):
             
             self.data["global_last_run_date"] = today_date_str
             self.data_changed = True
-            await self.save_data() # 状态更新后立即异步保存
+            await self.save_data()
             
             await self.run_inspection()
 
@@ -267,7 +258,6 @@ class ChatMasterPlugin(Star):
                     logger.info(f"ChatMaster: -> 群 {group_id} 结果: 需推送。共发现 {len(msg_list)} 人。")
                     final_msg = "\n".join(msg_list)
                     
-                    # 3. 网络重试机制
                     for attempt in range(self.MAX_RETRIES):
                         try:
                             await self.context.send_message(
@@ -282,7 +272,7 @@ class ChatMasterPlugin(Star):
                                 logger.warning(f"ChatMaster: 群 {group_id} 推送失败，重试 ({attempt+1}/{self.MAX_RETRIES})")
                                 await asyncio.sleep(1)
                                 
-                    await asyncio.sleep(2) # 批次间隔
+                    await asyncio.sleep(2)
                 else:
                     logger.info(f"ChatMaster: -> 群 {group_id} 结果: 无需推送。")
 
