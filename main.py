@@ -5,17 +5,18 @@ import copy
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
-from astrbot.api.all import Context, AstrMessageEvent, Star, register
+# 1. 移除 @register 装饰器，符合 AstrBot v4+ 最佳实践
+from astrbot.api.all import Context, AstrMessageEvent, Star
 from astrbot.api import logger
 from astrbot.api.star import StarTools
-# 显式导入 EventMessageType，并正确使用
 from astrbot.api.event import filter as astr_filter, EventMessageType
 
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.1")
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300
     CHECK_INTERVAL = 60
     MAX_RETRIES = 3
+    # 新增：补发窗口期 (小时)，例如超过设定时间 3 小时后就不再补发日报，避免深夜打扰
+    CATCH_UP_WINDOW = 3 
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -45,16 +46,16 @@ class ChatMasterPlugin(Star):
         返回: (hour, minute)
         """
         push_time_str = self.config.get("push_time", "09:00")
+        # 兼容中文冒号
         push_time_str = push_time_str.replace("：", ":")
+        
         try:
-            parts = push_time_str.split(':')
-            if len(parts) >= 2:
-                h, m = int(parts[0]), int(parts[1])
-                if 0 <= h < 24 and 0 <= m < 60:
-                    return h, m
-            raise ValueError("格式错误")
-        except Exception as e:
-            logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 无效 ({e})。已重置为 09:00")
+            # 2. 优化：使用 datetime.strptime 进行标准解析
+            t = datetime.strptime(push_time_str, "%H:%M")
+            return t.hour, t.minute
+        except ValueError as e:
+            # 3. 优化：精准捕获 ValueError
+            logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 格式无效 (应为 HH:MM)。已重置为 09:00")
             return 9, 0
 
     def refresh_config_cache(self):
@@ -124,7 +125,8 @@ class ChatMasterPlugin(Star):
         if not self.data_changed:
             return
         try:
-            # 深拷贝以确保线程安全，避免后台写入时数据被修改
+            # 5. 注释说明：deepcopy 在主线程执行，用于确保传递给后台线程的数据一致性。
+            # 虽然在数据量极大时可能有微小阻塞，但为了避免 RuntimeError，这是必要的权衡。
             data_copy = copy.deepcopy(self.data)
             await asyncio.to_thread(self._save_data_sync, data_copy)
             self.data_changed = False
@@ -143,12 +145,10 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
-    # 修复点1：正确使用 EventMessageType.GROUP_MESSAGE，不再通过 astr_filter 调用
     @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
         message_obj = event.message_obj
-        
-        # 修复点2：增加 sender 非空检查
+        # 增加防御性检查
         if not message_obj.group_id or not message_obj.sender:
             return
 
@@ -217,7 +217,6 @@ class ChatMasterPlugin(Star):
         while True:
             try:
                 self.refresh_config_cache()
-                # 解析时间并传递
                 target_h, target_m = self._parse_push_time()
                 await self.check_schedule(target_h, target_m)
                 
@@ -235,17 +234,28 @@ class ChatMasterPlugin(Star):
         now = datetime.now()
         today_date_str = now.strftime("%Y-%m-%d")
         
-        is_time_up = (now.hour > target_h) or (now.hour == target_h and now.minute >= target_m)
+        # 计算当前分钟数和目标分钟数
+        current_minutes = now.hour * 60 + now.minute
+        target_minutes = target_h * 60 + target_m
+        
+        # 4. 优化补发逻辑：只有在目标时间之后，且不超过窗口期（例如3小时）才触发
+        # 避免深夜上线补发早报的情况
+        is_time_up = current_minutes >= target_minutes
+        in_window = (current_minutes - target_minutes) <= (self.CATCH_UP_WINDOW * 60)
+        
         last_run = self.data.get("global_last_run_date", "")
         
         if is_time_up and last_run != today_date_str:
-            logger.info(f"ChatMaster: 到达设定时间 {target_h:02d}:{target_m:02d}，触发每日检测...")
+            if in_window:
+                logger.info(f"ChatMaster: 到达推送窗口 {target_h:02d}:{target_m:02d}，开始执行任务...")
+                await self.run_inspection()
+            else:
+                logger.warning(f"ChatMaster: 检测到错过了推送时间（超过{self.CATCH_UP_WINDOW}小时），今日不再补发。")
             
+            # 无论是否发送，都更新日期，避免重复尝试
             self.data["global_last_run_date"] = today_date_str
             self.data_changed = True
             await self.save_data()
-            
-            await self.run_inspection()
 
     async def run_inspection(self):
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
