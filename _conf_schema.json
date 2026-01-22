@@ -1,11 +1,29 @@
 {
   "monitored_groups": {
     "type": "list",
-    "description": "需要监控的群聊ID列表 (例如: 123456789)",
+    "description": "【总开关】需要监控的群聊ID列表。只有填入此处的群才会生效。",
     "default": [],
     "items": {
       "type": "string"
     }
+  },
+  "enable_whitelist": {
+    "type": "boolean",
+    "description": "【全局默认】是否开启白名单模式？(True=只监控配置了昵称的人, False=监控全员)",
+    "default": true
+  },
+  "whitelist_exception_groups": {
+    "type": "list",
+    "description": "【例外群组】在此列表中的群，将使用与上方“全局默认”相反的模式。",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
+  "enable_nickname_mapping": {
+    "type": "boolean",
+    "description": "是否启用昵称映射？开启后优先显示配置的昵称；关闭后直接显示“用户QQ号”。",
+    "default": true
   },
   "push_time": {
     "type": "string",
@@ -24,7 +42,7 @@
   },
   "nickname_mapping": {
     "type": "list",
-    "description": "昵称设置列表，格式为 'QQ:昵称' (例如: 123456:张三)",
+    "description": "昵称映射表 & 白名单列表。格式 'QQ:昵称'。",
     "default": [],
     "items": {
       "type": "string"
