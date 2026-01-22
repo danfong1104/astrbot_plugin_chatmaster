@@ -8,7 +8,7 @@
     }
   },
   "enable_whitelist": {
-    "type": "boolean",
+    "type": "bool",
     "description": "【全局默认】是否开启白名单模式？(True=只监控配置了昵称的人, False=监控全员)",
     "default": true
   },
@@ -21,7 +21,7 @@
     }
   },
   "enable_nickname_mapping": {
-    "type": "boolean",
+    "type": "bool",
     "description": "是否启用昵称映射？开启后优先显示配置的昵称；关闭后直接显示“用户QQ号”。",
     "default": true
   },
