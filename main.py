@@ -1,7 +1,7 @@
 import json
 import time
 import asyncio
-import copy # 1. 引入 copy 模块用于深拷贝
+import copy
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
@@ -10,7 +10,7 @@ from astrbot.api import logger
 from astrbot.api.star import StarTools
 from astrbot.api.event import filter as astr_filter, EventMessageType
 
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "1.3.0")
+@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.0")
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300
     CHECK_INTERVAL = 60
@@ -29,33 +29,46 @@ class ChatMasterPlugin(Star):
         
         self.nickname_cache = {}
         self.monitored_groups_set = set()
+        self.exception_groups_set = set() # 例外群组缓存
+        self.enable_whitelist_global = True
+        self.enable_mapping = True
+        
         self.refresh_config_cache()
-
         self._parse_push_time()
         
         self.scheduler_task = asyncio.create_task(self.scheduler_loop())
 
     def _parse_push_time(self) -> Tuple[int, int]:
-        """解析并验证推送时间"""
         push_time_str = self.config.get("push_time", "09:00")
         push_time_str = push_time_str.replace("：", ":")
         try:
-            # 2. 修复解析逻辑：更健壮的分割处理
             parts = push_time_str.split(':')
             if len(parts) >= 2:
-                h = int(parts[0])
-                m = int(parts[1])
+                h, m = int(parts[0]), int(parts[1])
                 if 0 <= h < 24 and 0 <= m < 60:
-                    # 更新实例变量供 check_schedule 使用
                     self.push_time_h, self.push_time_m = h, m
                     return h, m
-            raise ValueError("时间格式应为 HH:MM")
+            raise ValueError("格式错误")
         except Exception as e:
             logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 无效 ({e})。已重置为 09:00")
             self.push_time_h, self.push_time_m = 9, 0
             return 9, 0
 
     def refresh_config_cache(self):
+        """刷新配置缓存"""
+        # 开关与列表
+        self.enable_whitelist_global = self.config.get("enable_whitelist", True)
+        self.enable_mapping = self.config.get("enable_nickname_mapping", True)
+        
+        # 监控群组
+        raw_groups = self.config.get("monitored_groups", [])
+        self.monitored_groups_set = set(str(g) for g in raw_groups)
+        
+        # 例外群组
+        raw_exceptions = self.config.get("whitelist_exception_groups", [])
+        self.exception_groups_set = set(str(g) for g in raw_exceptions)
+
+        # 昵称映射
         mapping = {}
         raw_list = self.config.get("nickname_mapping", [])
         if raw_list:
@@ -73,8 +86,16 @@ class ChatMasterPlugin(Star):
                     mapping[qq] = name
         self.nickname_cache = mapping
 
-        raw_groups = self.config.get("monitored_groups", [])
-        self.monitored_groups_set = set(str(g) for g in raw_groups)
+    def _is_group_whitelist_mode(self, group_id: str) -> bool:
+        """判断指定群是否开启了白名单模式"""
+        # 默认使用全局设置
+        mode = self.enable_whitelist_global
+        
+        # 如果该群在例外列表中，则取反
+        if group_id in self.exception_groups_set:
+            mode = not mode
+            
+        return mode
 
     def load_data(self) -> Dict[str, Any]:
         default_data = {"global_last_run_date": "", "groups": {}}
@@ -82,16 +103,22 @@ class ChatMasterPlugin(Star):
             return default_data
         try:
             with open(self.data_file, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-                if loaded and "global_last_run_date" not in loaded:
-                    return {"global_last_run_date": "", "groups": loaded}
+                content = f.read().strip()
+                if not content:
+                    return default_data
+                loaded = json.loads(content)
+                if not isinstance(loaded, dict):
+                    return default_data
+                if "groups" not in loaded:
+                    loaded["groups"] = {}
+                if "global_last_run_date" not in loaded:
+                    loaded["global_last_run_date"] = ""
                 return loaded
         except Exception as e:
-            logger.error(f"ChatMaster 加载数据失败: {e}")
+            logger.error(f"ChatMaster 加载数据失败: {e}，使用空数据。")
             return default_data
 
     def _save_data_sync(self, data_snapshot: Dict[str, Any]):
-        """同步保存数据逻辑 (接收数据快照，线程安全)"""
         try:
             with open(self.data_file, 'w', encoding='utf-8') as f:
                 json.dump(data_snapshot, f, ensure_ascii=False, indent=2)
@@ -99,17 +126,11 @@ class ChatMasterPlugin(Star):
             logger.error(f"ChatMaster 保存数据失败: {e}")
 
     async def save_data(self):
-        """异步保存数据 (线程安全版)"""
         if not self.data_changed:
             return
         try:
-            # 3. 核心修复：在主线程创建数据深拷贝
-            # 这确保了传给后台线程的数据不会在写入过程中被 on_message 修改
             data_copy = copy.deepcopy(self.data)
-            
-            # 将数据快照传给线程
             await asyncio.to_thread(self._save_data_sync, data_copy)
-            
             self.data_changed = False
             self.last_save_time = time.time()
         except Exception as e:
@@ -118,10 +139,13 @@ class ChatMasterPlugin(Star):
     def terminate(self):
         if self.scheduler_task:
             self.scheduler_task.cancel()
-        
-        # 退出时使用同步保存，直接传递当前数据
         self._save_data_sync(self.data)
         logger.info("ChatMaster 插件已停止，数据已保存。")
+
+    def _get_display_name(self, user_id: str) -> str:
+        if self.enable_mapping and user_id in self.nickname_cache:
+            return self.nickname_cache[user_id]
+        return f"用户{user_id}"
 
     @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
@@ -132,12 +156,18 @@ class ChatMasterPlugin(Star):
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
         
+        # 1. 必须在总监控名单里
         if group_id not in self.monitored_groups_set:
             return
 
-        if user_id not in self.nickname_cache:
+        # 2. 判断该群的白名单策略
+        use_whitelist = self._is_group_whitelist_mode(group_id)
+        
+        # 如果该群开启白名单，且用户不在名单内 -> 忽略
+        if use_whitelist and user_id not in self.nickname_cache:
             return 
-
+        
+        # 否则（全员模式 或 用户在名单内）-> 记录
         if group_id not in self.data["groups"]:
             self.data["groups"][group_id] = {}
 
@@ -165,11 +195,18 @@ class ChatMasterPlugin(Star):
         
         self.refresh_config_cache()
         
+        # 获取当前群的模式
+        use_whitelist = self._is_group_whitelist_mode(group_id)
+        mode_str = "白名单模式" if use_whitelist else "全员监控模式"
+        msg_lines.append(f"当前模式: {mode_str}")
+        
         for user_id, last_seen_ts in group_data.items():
-            nickname = self.nickname_cache.get(user_id)
-            if not nickname:
+            # 过滤展示
+            if use_whitelist and user_id not in self.nickname_cache:
                 continue
                 
+            nickname = self._get_display_name(user_id)
+            
             last_seen_dt = datetime.fromtimestamp(last_seen_ts)
             last_seen_str = last_seen_dt.strftime('%Y-%m-%d %H:%M:%S')
             
@@ -187,7 +224,7 @@ class ChatMasterPlugin(Star):
         while True:
             try:
                 self.refresh_config_cache()
-                self._parse_push_time() # 刷新时间配置
+                self._parse_push_time()
                 await self.check_schedule()
                 
                 if self.data_changed and (time.time() - self.last_save_time > self.SAVE_INTERVAL):
@@ -229,20 +266,23 @@ class ChatMasterPlugin(Star):
         for group_id in self.monitored_groups_set:
             try:
                 group_data = self.data["groups"].get(group_id, {})
-                
                 if not group_data:
                     continue
+
+                # 判断该群模式
+                use_whitelist = self._is_group_whitelist_mode(group_id)
 
                 msg_list = []
                 
                 for user_id, last_seen_ts in group_data.items():
-                    nickname = self.nickname_cache.get(user_id)
-                    if not nickname:
+                    # 过滤逻辑
+                    if use_whitelist and user_id not in self.nickname_cache:
                         continue
                     
                     time_diff = now_ts - last_seen_ts
                     
                     if time_diff >= timeout_seconds:
+                        nickname = self._get_display_name(user_id)
                         days_silent = int(time_diff // 86400)
                         last_seen_str = datetime.fromtimestamp(last_seen_ts).strftime('%Y-%m-%d %H:%M:%S')
                         
@@ -269,7 +309,6 @@ class ChatMasterPlugin(Star):
                             if attempt == self.MAX_RETRIES - 1:
                                 logger.error(f"ChatMaster: 群 {group_id} 推送失败，放弃: {e}")
                             else:
-                                logger.warning(f"ChatMaster: 群 {group_id} 推送失败，重试 ({attempt+1}/{self.MAX_RETRIES})")
                                 await asyncio.sleep(1)
                                 
                     await asyncio.sleep(2)
