@@ -11,7 +11,7 @@ from astrbot.api.all import *
 from astrbot.api.event import filter
 from astrbot.api import logger
 
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.8")
+@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.9")
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300       # 自动保存间隔
     CHECK_INTERVAL = 60       # 检查循环间隔
@@ -45,10 +45,12 @@ class ChatMasterPlugin(Star):
         # 启动提示
         server_time = datetime.now().strftime("%H:%M")
         last_run = self.data.get("global_last_run_date", "无记录")
-        logger.info(f"ChatMaster v2.0.8 已加载。")
+        logger.info(f"ChatMaster v2.0.9 已加载。")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
-        logger.info(f" -> 上次运行日期: {last_run} (如果是今天，则今日不再自动推送)")
+        logger.info(f" -> 上次运行日期: {last_run}")
+        if last_run == datetime.now().strftime("%Y-%m-%d"):
+            logger.info(" -> ⚠️ 提示: 今日已执行过检测，如需重新测试，请发送 /重置检测")
 
         # 启动后台任务
         self.cleanup_task = asyncio.create_task(self._cleanup_old_data_async())
@@ -249,6 +251,14 @@ class ChatMasterPlugin(Star):
         msg_lines.append(f"\n共记录 {count} 人。")
         yield event.plain_result("\n".join(msg_lines))
 
+    # 新增：测试用的重置指令
+    @filter.command("重置检测")
+    async def reset_check_status(self, event: AstrMessageEvent):
+        self.data["global_last_run_date"] = ""
+        self.data_changed = True
+        await self.save_data()
+        yield event.plain_result("✅ 已重置检测状态，现在设置一个新的推送时间（或等待下一分钟）即可测试推送。")
+
     async def scheduler_loop(self):
         while True:
             try:
@@ -276,21 +286,20 @@ class ChatMasterPlugin(Star):
         current_minutes = now.hour * 60 + now.minute
         target_minutes = target_h * 60 + target_m
         
-        # 宽容度检查，确保不会因为秒数差异而错过
         is_time_up = current_minutes >= target_minutes
         in_window = (current_minutes - target_minutes) <= (self.CATCH_UP_WINDOW * 60)
         
         last_run = self.data.get("global_last_run_date", "")
         
-        # 调试日志：如果时间匹配但未执行，打印原因
+        # 优化日志：只有当正好是这一分钟时，且已经运行过，才提示（防止每分钟刷屏）
         if is_time_up and last_run == today_date_str:
-            # 这里的日志可以帮助你确认插件还在活着，但为了不刷屏，你可以注释掉
-            # logger.debug("ChatMaster: 已到达推送时间，但今日已执行过。")
-            pass
+            if current_minutes == target_minutes and now.second < 10:
+                logger.info("ChatMaster: ⏰ 时间已到，但今日已执行过任务，跳过。")
+            return
 
         if is_time_up and last_run != today_date_str:
             if in_window:
-                logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d}，开始执行检测任务...")
+                logger.info(f"ChatMaster: ⏰ 到达推送窗口 {target_h:02d}:{target_m:02d}，执行任务...")
                 await self.run_inspection()
             else:
                 logger.warning(f"ChatMaster: 错过推送时间（已过 {self.CATCH_UP_WINDOW} 小时窗口），今日不再补发。")
@@ -324,8 +333,8 @@ class ChatMasterPlugin(Star):
                     continue
 
                 msg_list = []
-                active_list = []   # 记录活跃用户
-                inactive_list = [] # 记录潜水用户
+                active_list = []
+                inactive_list = []
                 
                 user_items = list(group_data.items())
                 for i, (user_id, last_seen_ts) in enumerate(user_items):
@@ -351,7 +360,6 @@ class ChatMasterPlugin(Star):
                     else:
                         active_list.append(nickname)
                 
-                # 核心需求：无论是否推送，都要打印监控名单
                 if active_list:
                     logger.info(f"ChatMaster:   🟢 活跃人员 ({len(active_list)}): {', '.join(active_list)}")
                 if inactive_list:
