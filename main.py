@@ -46,9 +46,8 @@ class ChatMasterPlugin(Star):
         server_time = datetime.now().strftime("%H:%M")
         logger.info(f"ChatMaster v2.0.2 已加载。服务器时间: {server_time}，推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
-        # 启动清理 (异步执行，避免阻塞启动)
-        asyncio.create_task(self._cleanup_old_data_async())
-        
+        # 1. 修复资源泄漏：追踪后台清理任务
+        self.cleanup_task = asyncio.create_task(self._cleanup_old_data_async())
         self.scheduler_task = asyncio.create_task(self.scheduler_loop())
 
     def _parse_push_time(self) -> Tuple[int, int]:
@@ -127,29 +126,25 @@ class ChatMasterPlugin(Star):
 
     def _save_data_atomic(self, data_snapshot: Dict[str, Any]):
         """
-        原子化保存数据 (审核建议优化)
-        写入临时文件 -> 重命名，防止断电导致文件损坏
+        原子化保存数据
         """
+        temp_path = None # 2. 修复逻辑：预定义变量，防止 except 中报错
         try:
-            # 1. 创建临时文件
             fd, temp_path = tempfile.mkstemp(dir=self.data_dir, text=True)
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data_snapshot, f, ensure_ascii=False, indent=2)
-            
-            # 2. 原子替换
             os.replace(temp_path, self.data_file)
         except Exception as e:
             logger.error(f"ChatMaster 保存数据失败: {e}")
-            # 尝试清理临时文件
-            if 'temp_path' in locals() and os.path.exists(temp_path):
+            if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
 
     async def save_data(self):
         if not self.data_changed:
             return
         try:
+            # 深拷贝确保线程安全 (权衡：轻微阻塞主线程换取数据一致性)
             data_copy = copy.deepcopy(self.data)
-            # 使用原子保存方法
             await asyncio.to_thread(self._save_data_atomic, data_copy)
             self.data_changed = False
             self.last_save_time = time.time()
@@ -157,7 +152,7 @@ class ChatMasterPlugin(Star):
             logger.error(f"ChatMaster 异步保存出错: {e}")
 
     async def _cleanup_old_data_async(self):
-        """异步清理过期数据，防止阻塞主循环"""
+        """异步清理过期数据"""
         if not self.data.get("groups"):
             return
 
@@ -167,8 +162,7 @@ class ChatMasterPlugin(Star):
         groups_to_check = list(self.data["groups"].keys())
         
         for i, group_id in enumerate(groups_to_check):
-            # 优化：每处理5个群组让出控制权，防止卡顿 (审核建议)
-            if i % 5 == 0:
+            if i % 5 == 0: # 避免阻塞事件循环
                 await asyncio.sleep(0)
                 
             group_data = self.data["groups"][group_id]
@@ -179,14 +173,18 @@ class ChatMasterPlugin(Star):
                 removed_count += 1
 
         if removed_count > 0:
-            logger.info(f"ChatMaster: 自动清理了 {removed_count} 条超过 {self.CLEANUP_DAYS} 天的过期数据。")
+            logger.info(f"ChatMaster: 自动清理了 {removed_count} 条过期数据。")
             self.data_changed = True
 
     def terminate(self):
+        # 3. 修复资源泄漏：取消所有任务
         if self.scheduler_task:
             self.scheduler_task.cancel()
-        # 退出时尝试保存
+        if hasattr(self, 'cleanup_task') and self.cleanup_task:
+            self.cleanup_task.cancel()
+            
         try:
+            # 退出前最后一次保存（不使用 deepcopy 以加快退出）
             self._save_data_atomic(self.data)
         except:
             pass
@@ -197,7 +195,7 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
-    # 1. 监听函数：使用 *args, **kwargs 吸收所有多余参数 (核心修复)
+    # 事件监听：使用 *args, **kwargs 接收系统参数
     @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent, *args, **kwargs):
         message_obj = event.message_obj
@@ -220,9 +218,13 @@ class ChatMasterPlugin(Star):
         self.data["groups"][group_id][user_id] = time.time()
         self.data_changed = True 
 
-    # 2. 指令函数：使用 *args, **kwargs 吸收所有多余参数 (核心修复)
+    # 4. 终极修复：使用带默认值的占位参数解决 "必要参数缺失" 和 "参数过多" 的冲突
+    # _p1~_p8 是为了吃掉系统塞进来的 context, client 等参数
+    # 因为有默认值=None，指令解析器会认为它们是可选的，从而允许无参调用。
     @astr_filter.command("聊天检测")
-    async def manual_check(self, event: AstrMessageEvent, *args, **kwargs):
+    async def manual_check(self, event: AstrMessageEvent, 
+                           _p1=None, _p2=None, _p3=None, _p4=None, 
+                           _p5=None, _p6=None, _p7=None, _p8=None):
         message_obj = event.message_obj
         if not message_obj.group_id:
             yield event.plain_result("🚫 请在群聊中使用此命令。")
@@ -248,9 +250,8 @@ class ChatMasterPlugin(Star):
         user_items = list(group_data.items())
         
         for i, (user_id, last_seen_ts) in enumerate(user_items):
-            # 优化：数据量大时，防止指令卡死，定期让出控制权 (审核建议)
             if i % 50 == 0:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0) # 防止大群查询卡顿
 
             if use_whitelist and user_id not in self.nickname_cache:
                 continue
@@ -276,7 +277,6 @@ class ChatMasterPlugin(Star):
                 await self.check_schedule(target_h, target_m)
                 
                 if time.time() - self.last_cleanup_time > self.CLEANUP_INTERVAL:
-                    # 改为异步清理
                     await self._cleanup_old_data_async()
                     self.last_cleanup_time = time.time()
 
@@ -332,7 +332,6 @@ class ChatMasterPlugin(Star):
                 
                 user_items = list(group_data.items())
                 for i, (user_id, last_seen_ts) in enumerate(user_items):
-                    # 优化：防止阻塞
                     if i % 50 == 0:
                         await asyncio.sleep(0)
 
