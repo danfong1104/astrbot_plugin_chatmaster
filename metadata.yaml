@@ -1,0 +1,5 @@
+name: astrbot_plugin_chatmaster
+version: 1.2.0
+author: ChatMaster
+desc: 活跃度监控插件，支持每日定时播报及手动指令检测。
+url: https://github.com/YourName/astrbot_plugin_chatmaster

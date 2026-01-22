@@ -1,0 +1,33 @@
+{
+  "monitored_groups": {
+    "type": "list",
+    "description": "需要监控的群聊ID列表 (例如: 123456789)",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
+  "push_time": {
+    "type": "string",
+    "description": "每天自动播报的时间 (24小时制 HH:MM，例如 09:00)",
+    "default": "09:00"
+  },
+  "timeout_days": {
+    "type": "float",
+    "description": "超过多少天未发言才会被自动播报 (例如: 1.0)",
+    "default": 1.0
+  },
+  "alert_template": {
+    "type": "string",
+    "description": "自动播报的模板。变量: {nickname}, {days}, {last_seen}",
+    "default": "“{nickname}”已经“{days}”天没发言了（最后出现时间：{last_seen}）"
+  },
+  "nickname_mapping": {
+    "type": "list",
+    "description": "昵称设置列表，格式为 'QQ:昵称' (例如: 123456:张三)",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  }
+}
