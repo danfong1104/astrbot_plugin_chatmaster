@@ -8,12 +8,12 @@ from datetime import datetime
 from typing import Dict, Any, Tuple
 from pathlib import Path
 
-# 1. 规范化导入：移除 import *，解决热重载时的命名空间污染问题
-from astrbot.api.all import Context, AstrMessageEvent, Star
+from astrbot.api.all import *
 from astrbot.api.event import filter
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 
+@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.1.0")
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300       # 自动保存间隔
     CHECK_INTERVAL = 60       # 检查循环间隔
@@ -21,6 +21,7 @@ class ChatMasterPlugin(Star):
     MAX_RETRIES = 3           # 推送重试次数
     CATCH_UP_WINDOW = 3       # 补发窗口 (小时)
     CLEANUP_DAYS = 90         # 僵尸数据阈值
+    MAX_DISPLAY_COUNT = 50    # 单条消息最大显示人数 (防止消息过长发送失败)
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -29,14 +30,12 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
-        # 2. 修复路径操作：统一使用 Pathlib (官方建议)
-        # StarTools.get_data_dir 返回的是 Path 对象
+        # 1. 规范化路径操作：统一使用 Pathlib
         self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
-        # 使用 / 运算符拼接路径，替代 os.path.join
         self.data_file = self.data_dir / "data.json"
         
-        # 使用 Pathlib 的 mkdir 方法，更优雅
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        if not self.data_dir.exists():
+            self.data_dir.mkdir(parents=True, exist_ok=True)
         
         self.data = self.load_data()
         
@@ -56,13 +55,12 @@ class ChatMasterPlugin(Star):
         # 启动提示
         server_time = datetime.now().strftime("%H:%M")
         last_run = self.data.get("global_last_run_date", "无记录")
-        logger.info(f"ChatMaster v2.1.0 已加载 (Pathlib Fix)。")
+        logger.info(f"ChatMaster v2.1.0 已加载。")
         logger.info(f" -> 数据路径: {self.data_file}")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
         logger.info(f" -> 上次运行日期: {last_run}")
 
-        # 启动后台任务
         self.cleanup_task = asyncio.create_task(self._cleanup_old_data_async())
         self.scheduler_task = asyncio.create_task(self.scheduler_loop())
 
@@ -107,9 +105,7 @@ class ChatMasterPlugin(Star):
                             qq = parts[0].strip()
                             name = parts[1].strip()
                             mapping[qq] = name
-                except Exception as e:
-                    # 降低日志级别为 debug，防止启动时因格式问题刷屏
-                    # logger.debug(f"ChatMaster 配置解析跳过: '{item}' -> {e}")
+                except Exception:
                     continue
         self.nickname_cache = mapping
 
@@ -121,11 +117,9 @@ class ChatMasterPlugin(Star):
 
     def load_data(self) -> Dict[str, Any]:
         default_data = {"global_last_run_date": "", "groups": {}}
-        # Pathlib 风格的文件检查
         if not self.data_file.exists():
             return default_data
         try:
-            # Pathlib 读取文本
             content = self.data_file.read_text(encoding='utf-8').strip()
             if not content:
                 return default_data
@@ -142,15 +136,18 @@ class ChatMasterPlugin(Star):
             return default_data
 
     def _save_data_atomic(self, data_snapshot: Dict[str, Any]):
-        """原子化保存 (适配 Pathlib)"""
+        """原子化保存 (审核优化：二进制模式+明确编码)"""
         temp_path = None
         try:
-            # 在同一目录下创建临时文件，避免跨文件系统移动导致的权限问题
-            fd, temp_path = tempfile.mkstemp(dir=self.data_dir, text=True)
+            # 2. 优化：mkstemp 使用 text=False (二进制模式)，避免系统 locale 干扰
+            # dir=self.data_dir 确保在同一文件系统，保证 os.replace 原子性
+            fd, temp_path = tempfile.mkstemp(dir=self.data_dir, text=False)
+            
+            # 使用 os.fdopen 接管文件描述符，明确指定 utf-8
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data_snapshot, f, ensure_ascii=False, indent=2)
             
-            # 使用 os.replace 覆盖原文件 (Path 对象在 Py3.6+ 支持直接传入)
+            # Pathlib 支持直接传路径字符串给 replace
             os.replace(temp_path, self.data_file)
         except Exception as e:
             logger.error(f"ChatMaster 保存数据失败: {e}")
@@ -254,6 +251,11 @@ class ChatMasterPlugin(Star):
             if use_whitelist and user_id not in self.nickname_cache:
                 continue
             
+            # 3. 优化：防止消息过长导致发送失败
+            if count >= self.MAX_DISPLAY_COUNT:
+                msg_lines.append(f"\n⚠️ (列表过长，仅显示前 {self.MAX_DISPLAY_COUNT} 人...)")
+                break
+
             nickname = self._get_display_name(user_id)
             last_seen_dt = datetime.fromtimestamp(last_seen_ts)
             last_seen_str = last_seen_dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -278,10 +280,7 @@ class ChatMasterPlugin(Star):
     async def scheduler_loop(self):
         while True:
             try:
-                # 3. 修复逻辑缺陷：每次循环都刷新配置
-                # 这样修改配置文件后，无需重启插件即可在下一分钟生效
                 self.refresh_config_cache()
-                
                 target_h, target_m = self._parse_push_time()
                 await self.check_schedule(target_h, target_m)
                 
@@ -306,7 +305,6 @@ class ChatMasterPlugin(Star):
         current_minutes = now.hour * 60 + now.minute
         target_minutes = target_h * 60 + target_m
         
-        # 状态锁：防止同一分钟重复执行
         if current_minutes == self.last_processed_minute:
             return
         
@@ -366,6 +364,7 @@ class ChatMasterPlugin(Star):
                 inactive_names = []
                 
                 user_items = list(group_data.items())
+                count = 0 
                 for i, (user_id, last_seen_ts) in enumerate(user_items):
                     if i % 50 == 0: await asyncio.sleep(0)
 
@@ -375,28 +374,39 @@ class ChatMasterPlugin(Star):
                     nickname = self._get_display_name(user_id)
                     time_diff = now_ts - last_seen_ts
                     
+                    # 统计数据，但不在这里截断，因为要统计完整名单
                     if time_diff >= timeout_seconds:
                         days_silent = int(time_diff // 86400)
                         last_seen_str = datetime.fromtimestamp(last_seen_ts).strftime('%Y-%m-%d %H:%M:%S')
                         
-                        line = template.format(
-                            nickname=nickname, 
-                            days=days_silent, 
-                            last_seen=last_seen_str
-                        )
-                        msg_list.append(line)
+                        # 4. 优化：限制单条消息长度，防止API报错
+                        if count < self.MAX_DISPLAY_COUNT:
+                            line = template.format(
+                                nickname=nickname, 
+                                days=days_silent, 
+                                last_seen=last_seen_str
+                            )
+                            msg_list.append(line)
+                        
                         inactive_names.append(f"{nickname}({days_silent}天)")
                     else:
                         active_names.append(nickname)
+                    
+                    count += 1
                 
+                # 如果超过限制，追加提示
+                if count > self.MAX_DISPLAY_COUNT and len(msg_list) >= self.MAX_DISPLAY_COUNT:
+                     msg_list.append(f"\n⚠️ (名单过长，仅显示前 {self.MAX_DISPLAY_COUNT} 人...)")
+
                 if active_names:
-                    log_lines.append(f"  🟢 活跃人员 ({len(active_names)}): {', '.join(active_names)}")
+                    # 日志里可以显示多一点，取前100个
+                    log_lines.append(f"  🟢 活跃人员 ({len(active_names)}): {', '.join(active_names[:100])}{'...' if len(active_names)>100 else ''}")
                 if inactive_names:
-                    log_lines.append(f"  🔴 潜水人员 ({len(inactive_names)}): {', '.join(inactive_names)}")
+                    log_lines.append(f"  🔴 潜水人员 ({len(inactive_names)}): {', '.join(inactive_names[:100])}{'...' if len(inactive_names)>100 else ''}")
 
                 if msg_list:
                     if send_message:
-                        log_lines.append(f"  -> 结论: ❌ 发现 {len(msg_list)} 人潜水，正在推送...")
+                        log_lines.append(f"  -> 结论: ❌ 发现 {len(inactive_names)} 人潜水，正在推送...")
                         logger.info("\n".join(log_lines))
                         
                         final_msg = "\n".join(msg_list)
