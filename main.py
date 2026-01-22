@@ -2,11 +2,11 @@ import json
 import time
 import asyncio
 from datetime import datetime
-# 1. 修复命名空间污染：显式导入所需类，符合官方规范
+# 1. 修复命名遮蔽：显式导入并重命名 filter
 from astrbot.api.all import Context, AstrMessageEvent, Star, register
 from astrbot.api import logger
 from astrbot.api.star import StarTools
-from astrbot.api.event import filter
+from astrbot.api.event import filter as astr_filter
 
 @register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "1.3.0")
 class ChatMasterPlugin(Star):
@@ -14,8 +14,8 @@ class ChatMasterPlugin(Star):
         super().__init__(context)
         self.config = config
         self.data_changed = False 
+        self.last_save_time = time.time() # 记录上次保存时间
         
-        # 使用官方工具获取路径
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = self.data_dir / "data.json"
         
@@ -24,15 +24,13 @@ class ChatMasterPlugin(Star):
         self.nickname_cache = {}
         self.refresh_nickname_cache()
 
-        # 5. 修复时间解析脆弱性：初始化时就验证并解析时间
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
         self.scheduler_task = asyncio.create_task(self.scheduler_loop())
 
     def _parse_push_time(self):
-        """解析并验证推送时间，增加健壮性"""
+        """解析并验证推送时间"""
         push_time_str = self.config.get("push_time", "09:00")
-        # 兼容中文冒号
         push_time_str = push_time_str.replace("：", ":")
         try:
             h, m = map(int, push_time_str.split(':'))
@@ -80,17 +78,18 @@ class ChatMasterPlugin(Star):
             with open(self.data_file, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
             self.data_changed = False
+            self.last_save_time = time.time()
         except Exception as e:
             logger.error(f"ChatMaster 保存数据失败: {e}")
 
     def terminate(self):
-        """生命周期管理：插件卸载时保存数据"""
         if self.scheduler_task:
             self.scheduler_task.cancel()
         self.save_data()
         logger.info("ChatMaster 插件已停止，数据已保存。")
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    # 2. 使用重命名后的 astr_filter
+    @astr_filter.event_message_type(astr_filter.EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
         message_obj = event.message_obj
         if not message_obj.group_id:
@@ -99,11 +98,15 @@ class ChatMasterPlugin(Star):
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
         
+        # 3. 修复类型匹配陷阱 (严重)
+        # 无论配置里填的是 123456 (int) 还是 "123456" (str)，都统一转 str 对比
         monitored_groups = self.config.get("monitored_groups", [])
-        if monitored_groups and group_id not in monitored_groups:
+        monitored_groups_str = [str(g) for g in monitored_groups]
+        
+        if monitored_groups_str and group_id not in monitored_groups_str:
             return
 
-        # 保持你要求的白名单逻辑
+        # 保持白名单逻辑 (Response to Steve Jobs: 用户就是上帝)
         if user_id not in self.nickname_cache:
             return 
 
@@ -113,7 +116,7 @@ class ChatMasterPlugin(Star):
         self.data["groups"][group_id][user_id] = time.time()
         self.data_changed = True 
 
-    @filter.command("聊天检测")
+    @astr_filter.command("聊天检测")
     async def manual_check(self, event: AstrMessageEvent):
         message_obj = event.message_obj
         if not message_obj.group_id:
@@ -154,7 +157,11 @@ class ChatMasterPlugin(Star):
         while True:
             try:
                 await self.check_schedule()
-                self.save_data()
+                
+                # 4. 优化磁盘 I/O：每5分钟(300秒)才自动保存一次，或者在 check_schedule 里强制保存
+                if self.data_changed and (time.time() - self.last_save_time > 300):
+                    self.save_data()
+                    
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -165,7 +172,6 @@ class ChatMasterPlugin(Star):
         now = datetime.now()
         today_date_str = now.strftime("%Y-%m-%d")
         
-        # 使用预解析的时间，更安全
         target_h, target_m = self.push_time_h, self.push_time_m
 
         is_time_up = (now.hour > target_h) or (now.hour == target_h and now.minute >= target_m)
@@ -174,13 +180,10 @@ class ChatMasterPlugin(Star):
         if is_time_up and last_run != today_date_str:
             logger.info(f"ChatMaster: 到达设定时间 {target_h:02d}:{target_m:02d}，触发每日检测...")
             
-            # 2. 修复重试风暴的关键：先更新日期，再执行检测。
-            # 这样即使 run_inspection 发生网络错误崩溃，今天也不会再尝试第二次，避免刷屏。
             self.data["global_last_run_date"] = today_date_str
             self.data_changed = True
-            self.save_data() # 立即落盘，防止断电导致重复发送
+            self.save_data() # 每日任务执行时，强制保存一次
             
-            # 执行检测
             await self.run_inspection()
 
     async def run_inspection(self):
@@ -193,9 +196,8 @@ class ChatMasterPlugin(Star):
         logger.info(f"ChatMaster: === 开始执行活跃度检测 (阈值: {timeout_days_cfg}天) ===")
 
         for group_id in monitored_groups:
-            # 3. 修复异常粒度：使用 try-except 包裹每个群的逻辑
-            # 确保一个群发送失败（如被禁言）不会影响其他群的发送
             try:
+                # 这里做 str 转换是为了作为 key 去 data 字典里查，data 里的 key 都是 str
                 group_id = str(group_id)
                 group_data = self.data["groups"].get(group_id, {})
                 
@@ -230,11 +232,10 @@ class ChatMasterPlugin(Star):
                         target_group_id=group_id, 
                         message_str=f"📢 潜水员日报：\n{final_msg}"
                     )
-                    await asyncio.sleep(2) # 避免并发过快
+                    await asyncio.sleep(2)
                 else:
                     logger.info(f"ChatMaster: -> 群 {group_id} 结果: 无需推送。")
 
             except Exception as e:
-                # 记录错误但继续处理下一个群
                 logger.error(f"ChatMaster: 处理群 {group_id} 时发生错误: {e}")
                 continue
