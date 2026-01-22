@@ -21,7 +21,7 @@ class ChatMasterPlugin(Star):
     MAX_RETRIES = 3           # 推送重试次数
     CATCH_UP_WINDOW = 3       # 补发窗口 (小时)
     CLEANUP_DAYS = 90         # 僵尸数据阈值
-    MAX_DISPLAY_COUNT = 50    # 单条消息最大显示人数 (防止消息过长发送失败)
+    MAX_DISPLAY_COUNT = 50    # 单条消息最大显示人数
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -30,7 +30,7 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
-        # 1. 规范化路径操作：统一使用 Pathlib
+        # 1. 路径操作：全量 Pathlib 化
         self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = self.data_dir / "data.json"
         
@@ -55,7 +55,7 @@ class ChatMasterPlugin(Star):
         # 启动提示
         server_time = datetime.now().strftime("%H:%M")
         last_run = self.data.get("global_last_run_date", "无记录")
-        logger.info(f"ChatMaster v2.1.0 已加载。")
+        logger.info(f"ChatMaster v2.1.0 (Audit Refined) 已加载。")
         logger.info(f" -> 数据路径: {self.data_file}")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
@@ -136,18 +136,17 @@ class ChatMasterPlugin(Star):
             return default_data
 
     def _save_data_atomic(self, data_snapshot: Dict[str, Any]):
-        """原子化保存 (审核优化：二进制模式+明确编码)"""
+        """原子化保存 (使用二进制模式避免 locale 编码干扰)"""
         temp_path = None
         try:
-            # 2. 优化：mkstemp 使用 text=False (二进制模式)，避免系统 locale 干扰
-            # dir=self.data_dir 确保在同一文件系统，保证 os.replace 原子性
+            # mkstemp text=False (binary mode)
             fd, temp_path = tempfile.mkstemp(dir=self.data_dir, text=False)
             
-            # 使用 os.fdopen 接管文件描述符，明确指定 utf-8
+            # 使用 os.fdopen 接管，明确 UTF-8
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data_snapshot, f, ensure_ascii=False, indent=2)
             
-            # Pathlib 支持直接传路径字符串给 replace
+            # 原子替换
             os.replace(temp_path, self.data_file)
         except Exception as e:
             logger.error(f"ChatMaster 保存数据失败: {e}")
@@ -159,6 +158,8 @@ class ChatMasterPlugin(Star):
         if not self.data_changed:
             return
         try:
+            # 深拷贝快照，防止异步写入时数据变动
+            # 虽然有微小阻塞，但为了数据安全是必要的权衡
             data_copy = copy.deepcopy(self.data)
             await asyncio.to_thread(self._save_data_atomic, data_copy)
             self.data_changed = False
@@ -171,14 +172,24 @@ class ChatMasterPlugin(Star):
             return
         cutoff_time = time.time() - (self.CLEANUP_DAYS * 24 * 3600)
         removed_count = 0
+        
+        # 2. 防御性编程优化：处理并发修改风险
         groups_to_check = list(self.data["groups"].keys())
+        
         for i, group_id in enumerate(groups_to_check):
-            if i % 10 == 0: await asyncio.sleep(0)
-            group_data = self.data["groups"][group_id]
+            if i % 10 == 0: await asyncio.sleep(0) # 释放控制权
+            
+            # 关键修改：因为释放了控制权，groups 字典可能在期间被修改
+            # 所以这里必须使用 .get() 再次安全获取，防止 KeyError (评审团意见)
+            group_data = self.data["groups"].get(group_id)
+            if group_data is None: 
+                continue # 如果群组数据已被移除，则跳过
+                
             users_to_remove = [uid for uid, ts in group_data.items() if ts < cutoff_time]
             for uid in users_to_remove:
                 del group_data[uid]
                 removed_count += 1
+                
         if removed_count > 0:
             logger.info(f"ChatMaster: 自动清理了 {removed_count} 条过期数据。")
             self.data_changed = True
@@ -251,9 +262,8 @@ class ChatMasterPlugin(Star):
             if use_whitelist and user_id not in self.nickname_cache:
                 continue
             
-            # 3. 优化：防止消息过长导致发送失败
             if count >= self.MAX_DISPLAY_COUNT:
-                msg_lines.append(f"\n⚠️ (列表过长，仅显示前 {self.MAX_DISPLAY_COUNT} 人...)")
+                msg_lines.append(f"\n⚠️ (名单过长，系统截断前 {self.MAX_DISPLAY_COUNT} 位显示)")
                 break
 
             nickname = self._get_display_name(user_id)
@@ -280,7 +290,9 @@ class ChatMasterPlugin(Star):
     async def scheduler_loop(self):
         while True:
             try:
+                # 定期刷新配置以支持热更新
                 self.refresh_config_cache()
+                
                 target_h, target_m = self._parse_push_time()
                 await self.check_schedule(target_h, target_m)
                 
@@ -374,12 +386,11 @@ class ChatMasterPlugin(Star):
                     nickname = self._get_display_name(user_id)
                     time_diff = now_ts - last_seen_ts
                     
-                    # 统计数据，但不在这里截断，因为要统计完整名单
                     if time_diff >= timeout_seconds:
                         days_silent = int(time_diff // 86400)
                         last_seen_str = datetime.fromtimestamp(last_seen_ts).strftime('%Y-%m-%d %H:%M:%S')
                         
-                        # 4. 优化：限制单条消息长度，防止API报错
+                        # 3. 体验优化：限制日报消息长度
                         if count < self.MAX_DISPLAY_COUNT:
                             line = template.format(
                                 nickname=nickname, 
@@ -394,12 +405,11 @@ class ChatMasterPlugin(Star):
                     
                     count += 1
                 
-                # 如果超过限制，追加提示
                 if count > self.MAX_DISPLAY_COUNT and len(msg_list) >= self.MAX_DISPLAY_COUNT:
-                     msg_list.append(f"\n⚠️ (名单过长，仅显示前 {self.MAX_DISPLAY_COUNT} 人...)")
+                     msg_list.append(f"\n⚠️ (名单过长，系统截断前 {self.MAX_DISPLAY_COUNT} 位显示)")
 
                 if active_names:
-                    # 日志里可以显示多一点，取前100个
+                    # 日志显示前 100 位，比消息推送略多
                     log_lines.append(f"  🟢 活跃人员 ({len(active_names)}): {', '.join(active_names[:100])}{'...' if len(active_names)>100 else ''}")
                 if inactive_names:
                     log_lines.append(f"  🔴 潜水人员 ({len(inactive_names)}): {', '.join(inactive_names[:100])}{'...' if len(inactive_names)>100 else ''}")
