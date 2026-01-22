@@ -2,30 +2,40 @@ import json
 import time
 import asyncio
 from datetime import datetime
-# 1. 修复命名遮蔽：显式导入并重命名 filter
+# 显式导入所需类，避免命名空间污染
 from astrbot.api.all import Context, AstrMessageEvent, Star, register
 from astrbot.api import logger
 from astrbot.api.star import StarTools
+# 使用别名避免遮蔽内置 filter 函数
 from astrbot.api.event import filter as astr_filter
 
 @register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "1.3.0")
 class ChatMasterPlugin(Star):
+    # 定义类常量，消除魔术数字
+    SAVE_INTERVAL = 300  # 数据自动保存间隔 (秒)
+    CHECK_INTERVAL = 60  # 定时任务检查间隔 (秒)
+
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
         self.data_changed = False 
-        self.last_save_time = time.time() # 记录上次保存时间
+        self.last_save_time = time.time()
         
+        # 使用官方工具获取规范数据路径
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = self.data_dir / "data.json"
         
         self.data = self.load_data()
         
+        # 性能优化：预处理配置数据
         self.nickname_cache = {}
-        self.refresh_nickname_cache()
+        self.monitored_groups_set = set() # 使用集合存储，查找速度 O(1)
+        self.refresh_config_cache()
 
+        # 解析推送时间
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
+        # 启动后台任务
         self.scheduler_task = asyncio.create_task(self.scheduler_loop())
 
     def _parse_push_time(self):
@@ -38,12 +48,14 @@ class ChatMasterPlugin(Star):
                 return h, m
             else:
                 raise ValueError("时间数值越界")
-        except Exception as e:
+        # 优化：只捕获特定异常，避免掩盖其他错误
+        except (ValueError, IndexError) as e:
             logger.error(f"ChatMaster 配置错误: 推送时间 '{push_time_str}' 格式不正确 ({e})。已重置为 09:00")
             return 9, 0
 
-    def refresh_nickname_cache(self):
-        """刷新昵称缓存"""
+    def refresh_config_cache(self):
+        """刷新配置缓存 (昵称映射 & 监控群组)"""
+        # 1. 处理昵称映射 (白名单)
         mapping = {}
         raw_list = self.config.get("nickname_mapping", [])
         if raw_list:
@@ -56,6 +68,10 @@ class ChatMasterPlugin(Star):
                         name = parts[1].strip()
                         mapping[qq] = name
         self.nickname_cache = mapping
+
+        # 2. 处理监控群组 (转为字符串集合，提升 on_message 性能)
+        raw_groups = self.config.get("monitored_groups", [])
+        self.monitored_groups_set = set(str(g) for g in raw_groups)
 
     def load_data(self):
         default_data = {"global_last_run_date": "", "groups": {}}
@@ -83,30 +99,28 @@ class ChatMasterPlugin(Star):
             logger.error(f"ChatMaster 保存数据失败: {e}")
 
     def terminate(self):
+        """插件卸载生命周期"""
         if self.scheduler_task:
             self.scheduler_task.cancel()
         self.save_data()
         logger.info("ChatMaster 插件已停止，数据已保存。")
 
-    # 2. 使用重命名后的 astr_filter
     @astr_filter.event_message_type(astr_filter.EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
+        """消息处理：热点路径，必须高效"""
         message_obj = event.message_obj
         if not message_obj.group_id:
             return
 
+        # 转换为字符串以匹配配置
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
         
-        # 3. 修复类型匹配陷阱 (严重)
-        # 无论配置里填的是 123456 (int) 还是 "123456" (str)，都统一转 str 对比
-        monitored_groups = self.config.get("monitored_groups", [])
-        monitored_groups_str = [str(g) for g in monitored_groups]
-        
-        if monitored_groups_str and group_id not in monitored_groups_str:
+        # 优化：使用预处理的集合进行 O(1) 查找，不再每次消息都遍历列表
+        if group_id not in self.monitored_groups_set:
             return
 
-        # 保持白名单逻辑 (Response to Steve Jobs: 用户就是上帝)
+        # 逻辑说明：保留白名单模式 (用户明确要求仅记录配置了昵称的用户)
         if user_id not in self.nickname_cache:
             return 
 
@@ -158,15 +172,17 @@ class ChatMasterPlugin(Star):
             try:
                 await self.check_schedule()
                 
-                # 4. 优化磁盘 I/O：每5分钟(300秒)才自动保存一次，或者在 check_schedule 里强制保存
-                if self.data_changed and (time.time() - self.last_save_time > 300):
+                # 优化：使用常量控制保存间隔
+                if self.data_changed and (time.time() - self.last_save_time > self.SAVE_INTERVAL):
                     self.save_data()
                     
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"ChatMaster 调度出错: {e}")
-            await asyncio.sleep(60)
+            
+            # 优化：使用常量控制检查间隔
+            await asyncio.sleep(self.CHECK_INTERVAL)
 
     async def check_schedule(self):
         now = datetime.now()
@@ -182,11 +198,12 @@ class ChatMasterPlugin(Star):
             
             self.data["global_last_run_date"] = today_date_str
             self.data_changed = True
-            self.save_data() # 每日任务执行时，强制保存一次
+            self.save_data() 
             
             await self.run_inspection()
 
     async def run_inspection(self):
+        # 这里还是读取配置，防止配置热更新后 monitors 没变 (虽然 AstrBot 通常会重载插件)
         monitored_groups = self.config.get("monitored_groups", [])
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
         timeout_seconds = timeout_days_cfg * 24 * 3600
@@ -197,7 +214,6 @@ class ChatMasterPlugin(Star):
 
         for group_id in monitored_groups:
             try:
-                # 这里做 str 转换是为了作为 key 去 data 字典里查，data 里的 key 都是 str
                 group_id = str(group_id)
                 group_data = self.data["groups"].get(group_id, {})
                 
