@@ -7,11 +7,10 @@ import tempfile
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
-# 1. 修正导入：EventMessageType 必须从这里导入
+# 1. 修正导入路径：确保 EventMessageType 从 api.all 导入
 from astrbot.api.all import Context, AstrMessageEvent, Star, EventMessageType
 from astrbot.api import logger
 from astrbot.api.star import StarTools
-# 2. 修正导入：filter 单独导入
 from astrbot.api.event import filter as astr_filter
 
 class ChatMasterPlugin(Star):
@@ -46,13 +45,14 @@ class ChatMasterPlugin(Star):
         
         # 启动提示
         server_time = datetime.now().strftime("%H:%M")
-        logger.info(f"ChatMaster v2.0.3 已加载。服务器时间: {server_time}，推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
+        logger.info(f"ChatMaster v2.0.4 已加载。服务器时间: {server_time}，推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
-        # 启动清理
+        # 启动后台任务
         self.cleanup_task = asyncio.create_task(self._cleanup_old_data_async())
         self.scheduler_task = asyncio.create_task(self.scheduler_loop())
 
     def _parse_push_time(self) -> Tuple[int, int]:
+        """解析推送时间"""
         push_time_str = self.config.get("push_time", "09:00")
         push_time_str = str(push_time_str).replace("：", ":")
         try:
@@ -63,6 +63,7 @@ class ChatMasterPlugin(Star):
             return 9, 0
 
     def refresh_config_cache(self):
+        """刷新配置缓存"""
         self.enable_whitelist_global = self.config.get("enable_whitelist", True)
         self.enable_mapping = self.config.get("enable_nickname_mapping", True)
         
@@ -125,7 +126,7 @@ class ChatMasterPlugin(Star):
             return default_data
 
     def _save_data_atomic(self, data_snapshot: Dict[str, Any]):
-        """原子化保存"""
+        """原子化保存数据"""
         temp_path = None
         try:
             fd, temp_path = tempfile.mkstemp(dir=self.data_dir, text=True)
@@ -135,7 +136,10 @@ class ChatMasterPlugin(Star):
         except Exception as e:
             logger.error(f"ChatMaster 保存数据失败: {e}")
             if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
 
     async def save_data(self):
         if not self.data_changed:
@@ -149,6 +153,7 @@ class ChatMasterPlugin(Star):
             logger.error(f"ChatMaster 异步保存出错: {e}")
 
     async def _cleanup_old_data_async(self):
+        """异步清理过期数据"""
         if not self.data.get("groups"):
             return
 
@@ -157,9 +162,9 @@ class ChatMasterPlugin(Star):
         
         groups_to_check = list(self.data["groups"].keys())
         for i, group_id in enumerate(groups_to_check):
-            if i % 10 == 0:
-                await asyncio.sleep(0)
-            
+            if i % 5 == 0:
+                await asyncio.sleep(0) # 释放控制权
+                
             group_data = self.data["groups"][group_id]
             users_to_remove = [uid for uid, ts in group_data.items() if ts < cutoff_time]
             
@@ -171,14 +176,14 @@ class ChatMasterPlugin(Star):
             logger.info(f"ChatMaster: 自动清理了 {removed_count} 条过期数据。")
             self.data_changed = True
 
-    # 3. 关键修复：terminate 必须是 async 的！
+    # 3. 关键修复：terminate 必须是 async 的！否则重载插件时会报错
     async def terminate(self):
         if self.scheduler_task:
             self.scheduler_task.cancel()
         if hasattr(self, 'cleanup_task') and self.cleanup_task:
             self.cleanup_task.cancel()
-            
-        # 退出前保存
+        
+        # 退出前尝试同步保存一次
         try:
             self._save_data_atomic(self.data)
             logger.info("ChatMaster 插件已停止，数据已保存。")
@@ -190,6 +195,8 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
+    # 4. 终极修复：使用 *args, **kwargs 吞掉系统塞进来的 context 等参数
+    # 这样既不会报 TypeError，也不会报“参数缺失”
     @astr_filter.event_message_type(EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent, *args, **kwargs):
         message_obj = event.message_obj
@@ -212,6 +219,7 @@ class ChatMasterPlugin(Star):
         self.data["groups"][group_id][user_id] = time.time()
         self.data_changed = True 
 
+    # 5. 终极修复：同上，使用 *args 兼容所有参数，且不强制要求用户输入
     @astr_filter.command("聊天检测")
     async def manual_check(self, event: AstrMessageEvent, *args, **kwargs):
         message_obj = event.message_obj
