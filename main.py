@@ -5,12 +5,11 @@ import copy
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
-from astrbot.api.all import Context, AstrMessageEvent, Star, register
+from astrbot.api.all import Context, AstrMessageEvent, Star
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 from astrbot.api.event import filter as astr_filter, EventMessageType
 
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.1")
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300       # 自动保存间隔 (秒)
     CHECK_INTERVAL = 60       # 检查循环间隔 (秒)
@@ -42,11 +41,11 @@ class ChatMasterPlugin(Star):
         # 初始化时间解析
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
-        # 1. 启动时提示服务器时间，方便用户核对时区
+        # 启动时提示
         server_time = datetime.now().strftime("%H:%M")
         logger.info(f"ChatMaster 已加载。当前服务器时间: {server_time}，设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
-        # 2. 启动时立即执行一次数据清理，确保无死角
+        # 启动时立即执行一次数据清理
         self._cleanup_old_data()
         
         self.scheduler_task = asyncio.create_task(self.scheduler_loop())
@@ -54,8 +53,7 @@ class ChatMasterPlugin(Star):
     def _parse_push_time(self) -> Tuple[int, int]:
         """解析推送时间"""
         push_time_str = self.config.get("push_time", "09:00")
-        # 兼容中文冒号
-        push_time_str = push_time_str.replace("：", ":")
+        push_time_str = str(push_time_str).replace("：", ":")
         try:
             t = datetime.strptime(push_time_str, "%H:%M")
             return t.hour, t.minute
@@ -79,11 +77,9 @@ class ChatMasterPlugin(Star):
         if raw_list:
             for item in raw_list:
                 try:
-                    # 兼容字典格式
                     if isinstance(item, dict):
                         for k, v in item.items():
                             mapping[str(k).strip()] = str(v).strip()
-                    # 兼容字符串格式
                     else:
                         item_str = str(item)
                         parts = []
@@ -96,9 +92,8 @@ class ChatMasterPlugin(Star):
                             qq = parts[0].strip()
                             name = parts[1].strip()
                             mapping[qq] = name
-                # 3. 优化异常捕获：不吞没错误，打印具体警告
                 except (ValueError, IndexError, AttributeError) as e:
-                    logger.warning(f"ChatMaster 配置解析警告: 无法解析昵称条目 '{item}' -> {e}")
+                    logger.warning(f"ChatMaster 配置解析警告: 条目 '{item}' 无效 -> {e}")
                     continue
         self.nickname_cache = mapping
 
@@ -141,7 +136,6 @@ class ChatMasterPlugin(Star):
         if not self.data_changed:
             return
         try:
-            # 数据快照，防止并发写入问题
             data_copy = copy.deepcopy(self.data)
             await asyncio.to_thread(self._save_data_sync, data_copy)
             self.data_changed = False
@@ -204,8 +198,9 @@ class ChatMasterPlugin(Star):
         self.data["groups"][group_id][user_id] = time.time()
         self.data_changed = True 
 
+    # 🛠️ 修复点：增加 *args 接收所有多余参数，防止 TypeError
     @astr_filter.command("聊天检测")
-    async def manual_check(self, event: AstrMessageEvent):
+    async def manual_check(self, event: AstrMessageEvent, *args):
         message_obj = event.message_obj
         if not message_obj.group_id:
             yield event.plain_result("🚫 请在群聊中使用此命令。")
@@ -223,7 +218,6 @@ class ChatMasterPlugin(Star):
         now = time.time()
         count = 0
         
-        # 手动检测时可以刷新一次配置，保证昵称最新
         self.refresh_config_cache()
         
         use_whitelist = self._is_group_whitelist_mode(group_id)
@@ -252,16 +246,13 @@ class ChatMasterPlugin(Star):
     async def scheduler_loop(self):
         while True:
             try:
-                # 4. 优化：移除循环内的重复配置解析，AstrBot 重载插件时会重新初始化
-                # 仅执行调度逻辑
-                await self.check_schedule()
+                target_h, target_m = self._parse_push_time()
+                await self.check_schedule(target_h, target_m)
                 
-                # 独立的数据清理检查 (每24小时一次，不依赖推送时间窗口)
                 if time.time() - self.last_cleanup_time > self.CLEANUP_INTERVAL:
                     self._cleanup_old_data()
                     self.last_cleanup_time = time.time()
 
-                # 自动保存
                 if self.data_changed and (time.time() - self.last_save_time > self.SAVE_INTERVAL):
                     await self.save_data()
                     
@@ -272,11 +263,9 @@ class ChatMasterPlugin(Star):
             
             await asyncio.sleep(self.CHECK_INTERVAL)
 
-    async def check_schedule(self):
+    async def check_schedule(self, target_h: int, target_m: int):
         now = datetime.now()
         today_date_str = now.strftime("%Y-%m-%d")
-        
-        target_h, target_m = self.push_time_h, self.push_time_m
         
         current_minutes = now.hour * 60 + now.minute
         target_minutes = target_h * 60 + target_m
