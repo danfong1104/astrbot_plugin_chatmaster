@@ -1,0 +1,2 @@
+# astrbot_plugin_chatmaster
+一款检测群友活跃度的插件
