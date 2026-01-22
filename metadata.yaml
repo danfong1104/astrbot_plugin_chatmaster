@@ -1,5 +1,5 @@
 name: astrbot_plugin_chatmaster
 version: 1.2.5
-author: ChatMaster
+author: danfong1104
 desc: 一款群聊活跃度监控插件，支持每日定时播报及手动指令检测。
 url: https://github.com/danfong1104/astrbot_plugin_chatmaster
