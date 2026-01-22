@@ -11,7 +11,7 @@ from astrbot.api.all import *
 from astrbot.api.event import filter
 from astrbot.api import logger
 
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.9")
+@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.1.0")
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300       # 自动保存间隔
     CHECK_INTERVAL = 60       # 检查循环间隔
@@ -45,12 +45,10 @@ class ChatMasterPlugin(Star):
         # 启动提示
         server_time = datetime.now().strftime("%H:%M")
         last_run = self.data.get("global_last_run_date", "无记录")
-        logger.info(f"ChatMaster v2.0.9 已加载。")
+        logger.info(f"ChatMaster v2.1.0 已加载。")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
         logger.info(f" -> 上次运行日期: {last_run}")
-        if last_run == datetime.now().strftime("%Y-%m-%d"):
-            logger.info(" -> ⚠️ 提示: 今日已执行过检测，如需重新测试，请发送 /重置检测")
 
         # 启动后台任务
         self.cleanup_task = asyncio.create_task(self._cleanup_old_data_async())
@@ -251,13 +249,12 @@ class ChatMasterPlugin(Star):
         msg_lines.append(f"\n共记录 {count} 人。")
         yield event.plain_result("\n".join(msg_lines))
 
-    # 新增：测试用的重置指令
     @filter.command("重置检测")
     async def reset_check_status(self, event: AstrMessageEvent):
         self.data["global_last_run_date"] = ""
         self.data_changed = True
         await self.save_data()
-        yield event.plain_result("✅ 已重置检测状态，现在设置一个新的推送时间（或等待下一分钟）即可测试推送。")
+        yield event.plain_result("✅ 已重置状态，可立即测试推送。")
 
     async def scheduler_loop(self):
         while True:
@@ -288,36 +285,38 @@ class ChatMasterPlugin(Star):
         
         is_time_up = current_minutes >= target_minutes
         in_window = (current_minutes - target_minutes) <= (self.CATCH_UP_WINDOW * 60)
+        is_exact_minute = (current_minutes == target_minutes)
         
         last_run = self.data.get("global_last_run_date", "")
         
-        # 优化日志：只有当正好是这一分钟时，且已经运行过，才提示（防止每分钟刷屏）
-        if is_time_up and last_run == today_date_str:
-            if current_minutes == target_minutes and now.second < 10:
-                logger.info("ChatMaster: ⏰ 时间已到，但今日已执行过任务，跳过。")
-            return
-
+        # 情况1：正常推送 (时间到 + 没跑过 + 在窗口期)
         if is_time_up and last_run != today_date_str:
             if in_window:
-                logger.info(f"ChatMaster: ⏰ 到达推送窗口 {target_h:02d}:{target_m:02d}，执行任务...")
-                await self.run_inspection()
+                logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d}，执行正式推送...")
+                await self.run_inspection(send_message=True)
             else:
-                logger.warning(f"ChatMaster: 错过推送时间（已过 {self.CATCH_UP_WINDOW} 小时窗口），今日不再补发。")
+                logger.warning(f"ChatMaster: 错过推送时间（>{self.CATCH_UP_WINDOW}h），今日不补发。")
             
             self.data["global_last_run_date"] = today_date_str
             self.data_changed = True
             await self.save_data()
+            return
 
-    async def run_inspection(self):
+        # 情况2：整点自检 (时间正好是那一分钟 + 已经跑过) -> 强制输出日志但不发送
+        if is_exact_minute and last_run == today_date_str:
+            logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d}，执行后台自检 (不发送)...")
+            await self.run_inspection(send_message=False)
+
+    async def run_inspection(self, send_message: bool = True):
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
         timeout_seconds = timeout_days_cfg * 24 * 3600
         template = self.config.get("alert_template", "“{nickname}”已经“{days}”天没发言了")
         now_ts = time.time()
 
-        logger.info(f"ChatMaster: === 开始日报自检 (阈值: {timeout_days_cfg}天) ===")
+        logger.info(f"ChatMaster: === 开始日报检测 (send={send_message}) ===")
 
         if not self.monitored_groups_set:
-            logger.warning("ChatMaster: 未配置监控群组 (monitored_groups为空)，无法执行检测。")
+            logger.warning("ChatMaster: 未配置监控群组 (monitored_groups为空)。")
             return
 
         for group_id in self.monitored_groups_set:
@@ -326,10 +325,10 @@ class ChatMasterPlugin(Star):
                 use_whitelist = self._is_group_whitelist_mode(group_id)
                 mode_str = "白名单" if use_whitelist else "全员"
 
-                logger.info(f"ChatMaster: 正在检测群 {group_id} [{mode_str}模式]...")
+                logger.info(f"ChatMaster: 检测群 {group_id} [{mode_str}]...")
                 
                 if not group_data:
-                    logger.info(f"ChatMaster: -> 群 {group_id} 暂无任何活跃数据。")
+                    logger.info(f"ChatMaster: -> 暂无数据。")
                     continue
 
                 msg_list = []
@@ -361,31 +360,33 @@ class ChatMasterPlugin(Star):
                         active_list.append(nickname)
                 
                 if active_list:
-                    logger.info(f"ChatMaster:   🟢 活跃人员 ({len(active_list)}): {', '.join(active_list)}")
+                    logger.info(f"ChatMaster:   🟢 活跃人员: {', '.join(active_list)}")
                 if inactive_list:
-                    logger.info(f"ChatMaster:   🔴 潜水人员 ({len(inactive_list)}): {', '.join(inactive_list)}")
+                    logger.info(f"ChatMaster:   🔴 潜水人员: {', '.join(inactive_list)}")
 
                 if msg_list:
-                    logger.info(f"ChatMaster: -> 结论: ❌ 发现 {len(msg_list)} 人潜水，正在推送...")
-                    final_msg = "\n".join(msg_list)
-                    for attempt in range(self.MAX_RETRIES):
-                        try:
-                            await self.context.send_message(
-                                target_group_id=group_id, 
-                                message_str=f"📢 潜水员日报：\n{final_msg}"
-                            )
-                            break 
-                        except Exception as e:
-                            if attempt == self.MAX_RETRIES - 1:
-                                logger.error(f"ChatMaster: 群 {group_id} 推送失败: {e}")
-                            else:
-                                await asyncio.sleep(1)
-                    await asyncio.sleep(2)
+                    if send_message:
+                        logger.info(f"ChatMaster: -> 结论: ❌ 发现潜水员，正在推送...")
+                        final_msg = "\n".join(msg_list)
+                        for attempt in range(self.MAX_RETRIES):
+                            try:
+                                await self.context.send_message(
+                                    target_group_id=group_id, 
+                                    message_str=f"📢 潜水员日报：\n{final_msg}"
+                                )
+                                break 
+                            except Exception as e:
+                                if attempt == self.MAX_RETRIES - 1: logger.error(f"ChatMaster: 推送失败: {e}")
+                                else: await asyncio.sleep(1)
+                        await asyncio.sleep(2)
+                    else:
+                        # 你的核心需求：不发送时明确告知原因
+                        logger.info(f"ChatMaster: -> 结论: ❌ 发现潜水员，但今天 {datetime.now().strftime('%Y-%m-%d')} 已经推送过，故不发送。")
                 else:
-                    logger.info(f"ChatMaster: -> 结论: ✅ 全员活跃，无需推送。")
+                    logger.info(f"ChatMaster: -> 结论: ✅ 全员活跃。")
 
             except Exception as e:
-                logger.error(f"ChatMaster: 处理群 {group_id} 时发生错误: {e}")
+                logger.error(f"ChatMaster: 处理群 {group_id} 错误: {e}")
                 continue
         
-        logger.info("ChatMaster: === 日报检测结束 ===")
+        logger.info("ChatMaster: === 检测结束 ===")
