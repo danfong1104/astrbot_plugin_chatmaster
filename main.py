@@ -5,23 +5,26 @@ import copy
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
-from astrbot.api.all import Context, AstrMessageEvent, Star
+from astrbot.api.all import Context, AstrMessageEvent, Star, register
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 from astrbot.api.event import filter as astr_filter, EventMessageType
 
+@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.0.1")
 class ChatMasterPlugin(Star):
-    SAVE_INTERVAL = 300   # 自动保存间隔
-    CHECK_INTERVAL = 60   # 检查间隔
-    MAX_RETRIES = 3       # 推送重试次数
-    CATCH_UP_WINDOW = 3   # 补发窗口(小时)
-    CLEANUP_DAYS = 90     # 数据清理阈值：自动清理90天未发言的用户数据
+    SAVE_INTERVAL = 300       # 自动保存间隔 (秒)
+    CHECK_INTERVAL = 60       # 检查循环间隔 (秒)
+    CLEANUP_INTERVAL = 86400  # 强制清理间隔 (24小时)
+    MAX_RETRIES = 3           # 推送重试次数
+    CATCH_UP_WINDOW = 3       # 补发窗口 (小时)
+    CLEANUP_DAYS = 90         # 僵尸数据判定阈值 (天)
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
         self.data_changed = False 
         self.last_save_time = time.time()
+        self.last_cleanup_time = time.time()
         
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = self.data_dir / "data.json"
@@ -34,14 +37,25 @@ class ChatMasterPlugin(Star):
         self.enable_whitelist_global = True
         self.enable_mapping = True
         
+        # 初始化配置
         self.refresh_config_cache()
+        # 初始化时间解析
+        self.push_time_h, self.push_time_m = self._parse_push_time()
+        
+        # 1. 启动时提示服务器时间，方便用户核对时区
+        server_time = datetime.now().strftime("%H:%M")
+        logger.info(f"ChatMaster 已加载。当前服务器时间: {server_time}，设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
+
+        # 2. 启动时立即执行一次数据清理，确保无死角
+        self._cleanup_old_data()
         
         self.scheduler_task = asyncio.create_task(self.scheduler_loop())
 
     def _parse_push_time(self) -> Tuple[int, int]:
         """解析推送时间"""
         push_time_str = self.config.get("push_time", "09:00")
-        push_time_str = str(push_time_str).replace("：", ":")
+        # 兼容中文冒号
+        push_time_str = push_time_str.replace("：", ":")
         try:
             t = datetime.strptime(push_time_str, "%H:%M")
             return t.hour, t.minute
@@ -50,7 +64,7 @@ class ChatMasterPlugin(Star):
             return 9, 0
 
     def refresh_config_cache(self):
-        """刷新配置缓存 (兼容 String 和 Dict 格式)"""
+        """刷新配置缓存"""
         self.enable_whitelist_global = self.config.get("enable_whitelist", True)
         self.enable_mapping = self.config.get("enable_nickname_mapping", True)
         
@@ -65,11 +79,11 @@ class ChatMasterPlugin(Star):
         if raw_list:
             for item in raw_list:
                 try:
-                    # 情况1: YAML 解析为 Dict (例如 - 123: 张三)
+                    # 兼容字典格式
                     if isinstance(item, dict):
                         for k, v in item.items():
                             mapping[str(k).strip()] = str(v).strip()
-                    # 情况2: YAML 解析为 String (例如 - "123:张三")
+                    # 兼容字符串格式
                     else:
                         item_str = str(item)
                         parts = []
@@ -82,8 +96,10 @@ class ChatMasterPlugin(Star):
                             qq = parts[0].strip()
                             name = parts[1].strip()
                             mapping[qq] = name
-                except Exception:
-                    continue # 跳过格式错误的条目
+                # 3. 优化异常捕获：不吞没错误，打印具体警告
+                except (ValueError, IndexError, AttributeError) as e:
+                    logger.warning(f"ChatMaster 配置解析警告: 无法解析昵称条目 '{item}' -> {e}")
+                    continue
         self.nickname_cache = mapping
 
     def _is_group_whitelist_mode(self, group_id: str) -> bool:
@@ -125,7 +141,7 @@ class ChatMasterPlugin(Star):
         if not self.data_changed:
             return
         try:
-            # 通过自动清理机制，控制 data 大小，从而降低 deepcopy 的阻塞风险
+            # 数据快照，防止并发写入问题
             data_copy = copy.deepcopy(self.data)
             await asyncio.to_thread(self._save_data_sync, data_copy)
             self.data_changed = False
@@ -134,27 +150,21 @@ class ChatMasterPlugin(Star):
             logger.error(f"ChatMaster 异步保存出错: {e}")
 
     def _cleanup_old_data(self):
-        """清理超过 CLEANUP_DAYS 天未活跃的数据"""
+        """清理长期未活跃的数据"""
         if not self.data.get("groups"):
             return
 
         cutoff_time = time.time() - (self.CLEANUP_DAYS * 24 * 3600)
         removed_count = 0
         
-        # 遍历所有群组
         groups_to_check = list(self.data["groups"].keys())
         for group_id in groups_to_check:
             group_data = self.data["groups"][group_id]
-            # 找出该群内所有超时用户
             users_to_remove = [uid for uid, ts in group_data.items() if ts < cutoff_time]
             
             for uid in users_to_remove:
                 del group_data[uid]
                 removed_count += 1
-            
-            # 如果群组空了，也可以清理群组 key (可选，这里暂时保留群组key)
-            # if not group_data:
-            #     del self.data["groups"][group_id]
 
         if removed_count > 0:
             logger.info(f"ChatMaster: 自动清理了 {removed_count} 条超过 {self.CLEANUP_DAYS} 天未活跃的数据。")
@@ -213,6 +223,7 @@ class ChatMasterPlugin(Star):
         now = time.time()
         count = 0
         
+        # 手动检测时可以刷新一次配置，保证昵称最新
         self.refresh_config_cache()
         
         use_whitelist = self._is_group_whitelist_mode(group_id)
@@ -241,10 +252,16 @@ class ChatMasterPlugin(Star):
     async def scheduler_loop(self):
         while True:
             try:
-                self.refresh_config_cache()
-                target_h, target_m = self._parse_push_time()
-                await self.check_schedule(target_h, target_m)
+                # 4. 优化：移除循环内的重复配置解析，AstrBot 重载插件时会重新初始化
+                # 仅执行调度逻辑
+                await self.check_schedule()
                 
+                # 独立的数据清理检查 (每24小时一次，不依赖推送时间窗口)
+                if time.time() - self.last_cleanup_time > self.CLEANUP_INTERVAL:
+                    self._cleanup_old_data()
+                    self.last_cleanup_time = time.time()
+
+                # 自动保存
                 if self.data_changed and (time.time() - self.last_save_time > self.SAVE_INTERVAL):
                     await self.save_data()
                     
@@ -255,9 +272,11 @@ class ChatMasterPlugin(Star):
             
             await asyncio.sleep(self.CHECK_INTERVAL)
 
-    async def check_schedule(self, target_h: int, target_m: int):
+    async def check_schedule(self):
         now = datetime.now()
         today_date_str = now.strftime("%Y-%m-%d")
+        
+        target_h, target_m = self.push_time_h, self.push_time_m
         
         current_minutes = now.hour * 60 + now.minute
         target_minutes = target_h * 60 + target_m
@@ -269,9 +288,7 @@ class ChatMasterPlugin(Star):
         
         if is_time_up and last_run != today_date_str:
             if in_window:
-                logger.info(f"ChatMaster: 到达推送窗口 {target_h:02d}:{target_m:02d}，执行任务并清理旧数据...")
-                # 每日任务时执行数据清理
-                self._cleanup_old_data()
+                logger.info(f"ChatMaster: 到达推送窗口 {target_h:02d}:{target_m:02d}，执行任务...")
                 await self.run_inspection()
             else:
                 logger.warning(f"ChatMaster: 错过推送时间（>{self.CATCH_UP_WINDOW}h），今日不补发。")
