@@ -13,7 +13,7 @@ from astrbot.api.event import filter
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.1.0")
+# 移除 @register 装饰器 (官方废弃，直接定义类即可)
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300       # 自动保存间隔
     CHECK_INTERVAL = 60       # 检查循环间隔
@@ -46,7 +46,6 @@ class ChatMasterPlugin(Star):
         self.enable_mapping = True
         
         # 事件缓存：group_id -> AstrMessageEvent
-        # 用于在主动推送时找不到发送通道的“救命稻草”
         self.group_event_cache: Dict[str, AstrMessageEvent] = {}
         
         self.last_processed_minute = -1
@@ -56,7 +55,7 @@ class ChatMasterPlugin(Star):
         
         server_time = datetime.now().strftime("%H:%M")
         last_run = self.data.get("global_last_run_date", "无记录")
-        logger.info(f"ChatMaster v2.1.0 已加载 (SendFix)。")
+        logger.info(f"ChatMaster v2.1.0 已加载 (Final Fix)。")
         logger.info(f" -> 数据路径: {self.data_file}")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
@@ -208,7 +207,7 @@ class ChatMasterPlugin(Star):
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
         
-        # 缓存该群的最新事件，作为发送消息的“句柄”
+        # 缓存事件，作为发送句柄
         self.group_event_cache[group_id] = event
         
         if group_id not in self.monitored_groups_set:
@@ -335,8 +334,10 @@ class ChatMasterPlugin(Star):
             return
 
         if current_minutes == target_minutes and last_run == today_date_str:
-            logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d} (今日已执行过)，执行后台自检...")
-            await self.run_inspection(send_message=False)
+            # 整点自检
+            if now.second < 15: # 只在前15秒触发一次日志，防止重复
+                logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d} (今日已执行过)，执行后台自检...")
+                await self.run_inspection(send_message=False)
 
     async def run_inspection(self, send_message: bool = True):
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
@@ -409,12 +410,8 @@ class ChatMasterPlugin(Star):
                         
                         final_msg = "\n".join(msg_list)
                         
-                        # 核心修复：尝试使用多种方式推送
-                        # 1. 优先尝试标准的 group_id 参数 (修复之前的 target_group_id 错误)
-                        # 2. 如果失败，尝试使用 event 缓存进行回复 (Fallback)
+                        # 尝试多种发送方式
                         success = False
-                        
-                        # 尝试方案 A: 标准推送
                         if not success:
                             try:
                                 await asyncio.wait_for(
@@ -426,9 +423,8 @@ class ChatMasterPlugin(Star):
                                 )
                                 success = True
                             except Exception as e:
-                                log_lines.append(f"  -> ⚠️ 标准推送失败 ({e})，尝试使用事件缓存...")
+                                log_lines.append(f"  -> ⚠️ 标准推送失败 ({e})，尝试事件缓存...")
                         
-                        # 尝试方案 B: 事件缓存回复 (如果机器人重启后未收到该群消息，此法无效)
                         if not success:
                             cached_event = self.group_event_cache.get(group_id)
                             if cached_event:
@@ -442,9 +438,9 @@ class ChatMasterPlugin(Star):
                                     )
                                     success = True
                                 except Exception as e:
-                                    logger.error(f"ChatMaster: 群 {group_id} 缓存回复也失败: {e}")
+                                    logger.error(f"ChatMaster: 群 {group_id} 缓存推送也失败: {e}")
                             else:
-                                logger.warning(f"ChatMaster: 群 {group_id} 无缓存事件，且标准推送失败。请确认机器人是否已在该群发言。")
+                                logger.warning(f"ChatMaster: 群 {group_id} 无缓存，且标准推送失败。请检查机器人状态。")
 
                     else:
                         log_lines.append(f"  -> 结论: ⚠️ 发现潜水人员，但 [今日已推送过] (拦截发送)。")
