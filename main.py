@@ -5,10 +5,10 @@ import asyncio
 import copy
 import tempfile
 from datetime import datetime
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 from pathlib import Path
 
-from astrbot.api.all import *
+from astrbot.api.all import Context, AstrMessageEvent, Star
 from astrbot.api.event import filter
 from astrbot.api import logger
 from astrbot.api.star import StarTools
@@ -21,7 +21,8 @@ class ChatMasterPlugin(Star):
     MAX_RETRIES = 3           # 推送重试次数
     CATCH_UP_WINDOW = 3       # 补发窗口 (小时)
     CLEANUP_DAYS = 90         # 僵尸数据阈值
-    MAX_DISPLAY_COUNT = 50    # 单条消息最大显示人数 (防止消息过长发送失败)
+    MAX_DISPLAY_COUNT = 50    # 单条消息最大显示人数
+    SEND_TIMEOUT = 15.0       # 推送超时 (秒)
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -30,7 +31,6 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
-        # 1. 规范化路径操作：统一使用 Pathlib
         self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = self.data_dir / "data.json"
         
@@ -45,17 +45,18 @@ class ChatMasterPlugin(Star):
         self.enable_whitelist_global = True
         self.enable_mapping = True
         
-        # 调度器状态锁
+        # 事件缓存：group_id -> AstrMessageEvent
+        # 用于在主动推送时找不到发送通道的“救命稻草”
+        self.group_event_cache: Dict[str, AstrMessageEvent] = {}
+        
         self.last_processed_minute = -1
         
-        # 初始化配置
         self.refresh_config_cache()
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
-        # 启动提示
         server_time = datetime.now().strftime("%H:%M")
         last_run = self.data.get("global_last_run_date", "无记录")
-        logger.info(f"ChatMaster v2.1.0 已加载。")
+        logger.info(f"ChatMaster v2.1.0 已加载 (SendFix)。")
         logger.info(f" -> 数据路径: {self.data_file}")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
@@ -75,7 +76,6 @@ class ChatMasterPlugin(Star):
             return 9, 0
 
     def refresh_config_cache(self):
-        """刷新配置缓存"""
         self.enable_whitelist_global = self.config.get("enable_whitelist", True)
         self.enable_mapping = self.config.get("enable_nickname_mapping", True)
         
@@ -124,30 +124,27 @@ class ChatMasterPlugin(Star):
             if not content:
                 return default_data
             loaded = json.loads(content)
+            
             if not isinstance(loaded, dict):
                 return default_data
-            if "groups" not in loaded:
+            
+            if "groups" not in loaded or not isinstance(loaded["groups"], dict):
                 loaded["groups"] = {}
+                
             if "global_last_run_date" not in loaded:
                 loaded["global_last_run_date"] = ""
+                
             return loaded
         except Exception as e:
             logger.error(f"ChatMaster 加载数据失败: {e}，使用空数据。")
             return default_data
 
     def _save_data_atomic(self, data_snapshot: Dict[str, Any]):
-        """原子化保存 (审核优化：二进制模式+明确编码)"""
         temp_path = None
         try:
-            # 2. 优化：mkstemp 使用 text=False (二进制模式)，避免系统 locale 干扰
-            # dir=self.data_dir 确保在同一文件系统，保证 os.replace 原子性
             fd, temp_path = tempfile.mkstemp(dir=self.data_dir, text=False)
-            
-            # 使用 os.fdopen 接管文件描述符，明确指定 utf-8
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data_snapshot, f, ensure_ascii=False, indent=2)
-            
-            # Pathlib 支持直接传路径字符串给 replace
             os.replace(temp_path, self.data_file)
         except Exception as e:
             logger.error(f"ChatMaster 保存数据失败: {e}")
@@ -159,8 +156,8 @@ class ChatMasterPlugin(Star):
         if not self.data_changed:
             return
         try:
-            data_copy = copy.deepcopy(self.data)
-            await asyncio.to_thread(self._save_data_atomic, data_copy)
+            data_snapshot = self.data.copy()
+            await asyncio.to_thread(self._save_data_atomic, data_snapshot)
             self.data_changed = False
             self.last_save_time = time.time()
         except Exception as e:
@@ -172,13 +169,18 @@ class ChatMasterPlugin(Star):
         cutoff_time = time.time() - (self.CLEANUP_DAYS * 24 * 3600)
         removed_count = 0
         groups_to_check = list(self.data["groups"].keys())
+        
         for i, group_id in enumerate(groups_to_check):
             if i % 10 == 0: await asyncio.sleep(0)
-            group_data = self.data["groups"][group_id]
+            
+            group_data = self.data["groups"].get(group_id)
+            if group_data is None: continue
+                
             users_to_remove = [uid for uid, ts in group_data.items() if ts < cutoff_time]
             for uid in users_to_remove:
                 del group_data[uid]
                 removed_count += 1
+                
         if removed_count > 0:
             logger.info(f"ChatMaster: 自动清理了 {removed_count} 条过期数据。")
             self.data_changed = True
@@ -205,6 +207,9 @@ class ChatMasterPlugin(Star):
 
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
+        
+        # 缓存该群的最新事件，作为发送消息的“句柄”
+        self.group_event_cache[group_id] = event
         
         if group_id not in self.monitored_groups_set:
             return
@@ -251,9 +256,8 @@ class ChatMasterPlugin(Star):
             if use_whitelist and user_id not in self.nickname_cache:
                 continue
             
-            # 3. 优化：防止消息过长导致发送失败
             if count >= self.MAX_DISPLAY_COUNT:
-                msg_lines.append(f"\n⚠️ (列表过长，仅显示前 {self.MAX_DISPLAY_COUNT} 人...)")
+                msg_lines.append(f"\n⚠️ (名单过长，系统截断前 {self.MAX_DISPLAY_COUNT} 位显示)")
                 break
 
             nickname = self._get_display_name(user_id)
@@ -318,7 +322,6 @@ class ChatMasterPlugin(Star):
 
         last_run = self.data.get("global_last_run_date", "")
         
-        # 逻辑1：正常推送
         if is_time_up and last_run != today_date_str:
             if in_window:
                 logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d} (今日首次)，执行任务...")
@@ -331,7 +334,6 @@ class ChatMasterPlugin(Star):
             await self.save_data()
             return
 
-        # 逻辑2：后台自检 (已跑过 + 整点)
         if current_minutes == target_minutes and last_run == today_date_str:
             logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d} (今日已执行过)，执行后台自检...")
             await self.run_inspection(send_message=False)
@@ -374,12 +376,10 @@ class ChatMasterPlugin(Star):
                     nickname = self._get_display_name(user_id)
                     time_diff = now_ts - last_seen_ts
                     
-                    # 统计数据，但不在这里截断，因为要统计完整名单
                     if time_diff >= timeout_seconds:
                         days_silent = int(time_diff // 86400)
                         last_seen_str = datetime.fromtimestamp(last_seen_ts).strftime('%Y-%m-%d %H:%M:%S')
                         
-                        # 4. 优化：限制单条消息长度，防止API报错
                         if count < self.MAX_DISPLAY_COUNT:
                             line = template.format(
                                 nickname=nickname, 
@@ -394,12 +394,10 @@ class ChatMasterPlugin(Star):
                     
                     count += 1
                 
-                # 如果超过限制，追加提示
                 if count > self.MAX_DISPLAY_COUNT and len(msg_list) >= self.MAX_DISPLAY_COUNT:
-                     msg_list.append(f"\n⚠️ (名单过长，仅显示前 {self.MAX_DISPLAY_COUNT} 人...)")
+                     msg_list.append(f"\n⚠️ (名单过长，系统截断前 {self.MAX_DISPLAY_COUNT} 位显示)")
 
                 if active_names:
-                    # 日志里可以显示多一点，取前100个
                     log_lines.append(f"  🟢 活跃人员 ({len(active_names)}): {', '.join(active_names[:100])}{'...' if len(active_names)>100 else ''}")
                 if inactive_names:
                     log_lines.append(f"  🔴 潜水人员 ({len(inactive_names)}): {', '.join(inactive_names[:100])}{'...' if len(inactive_names)>100 else ''}")
@@ -410,19 +408,44 @@ class ChatMasterPlugin(Star):
                         logger.info("\n".join(log_lines))
                         
                         final_msg = "\n".join(msg_list)
-                        for attempt in range(self.MAX_RETRIES):
+                        
+                        # 核心修复：尝试使用多种方式推送
+                        # 1. 优先尝试标准的 group_id 参数 (修复之前的 target_group_id 错误)
+                        # 2. 如果失败，尝试使用 event 缓存进行回复 (Fallback)
+                        success = False
+                        
+                        # 尝试方案 A: 标准推送
+                        if not success:
                             try:
-                                await self.context.send_message(
-                                    target_group_id=group_id, 
-                                    message_str=f"📢 潜水员日报：\n{final_msg}"
+                                await asyncio.wait_for(
+                                    self.context.send_message(
+                                        group_id=group_id, 
+                                        message_str=f"📢 潜水员日报：\n{final_msg}"
+                                    ),
+                                    timeout=self.SEND_TIMEOUT
                                 )
-                                break 
+                                success = True
                             except Exception as e:
-                                if attempt == self.MAX_RETRIES - 1:
-                                    logger.error(f"ChatMaster: 群 {group_id} 推送失败: {e}")
-                                else:
-                                    await asyncio.sleep(1)
-                        await asyncio.sleep(2)
+                                log_lines.append(f"  -> ⚠️ 标准推送失败 ({e})，尝试使用事件缓存...")
+                        
+                        # 尝试方案 B: 事件缓存回复 (如果机器人重启后未收到该群消息，此法无效)
+                        if not success:
+                            cached_event = self.group_event_cache.get(group_id)
+                            if cached_event:
+                                try:
+                                    await asyncio.wait_for(
+                                        self.context.send_message(
+                                            event=cached_event,
+                                            message_str=f"📢 潜水员日报：\n{final_msg}"
+                                        ),
+                                        timeout=self.SEND_TIMEOUT
+                                    )
+                                    success = True
+                                except Exception as e:
+                                    logger.error(f"ChatMaster: 群 {group_id} 缓存回复也失败: {e}")
+                            else:
+                                logger.warning(f"ChatMaster: 群 {group_id} 无缓存事件，且标准推送失败。请确认机器人是否已在该群发言。")
+
                     else:
                         log_lines.append(f"  -> 结论: ⚠️ 发现潜水人员，但 [今日已推送过] (拦截发送)。")
                         logger.info("\n".join(log_lines))
