@@ -13,7 +13,7 @@ from astrbot.api.event import filter
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 
-@register("astrbot_plugin_chatmaster", "ChatMaster", "活跃度监控插件", "2.1.1")
+# 修复点：移除了 @register 装饰器，AstrBot 会自动识别 Star 子类
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300       # 自动保存间隔
     CHECK_INTERVAL = 60       # 检查循环间隔
@@ -30,6 +30,7 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
+        # 路径操作：全量 Pathlib 化
         self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = self.data_dir / "data.json"
         
@@ -46,14 +47,15 @@ class ChatMasterPlugin(Star):
         
         self.group_event_cache: Dict[str, AstrMessageEvent] = {}
         
-        # 调度器状态锁 (防止同一分钟重复触发)
+        # 调度器状态锁
         self.last_processed_minute = -1
         
         self.refresh_config_cache()
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
         server_time = datetime.now().strftime("%H:%M")
-        logger.info(f"ChatMaster v2.1.1 已加载 (Removed Daily Limit)。")
+        logger.info(f"ChatMaster v2.1.1 已加载 (Fix NameError)。")
+        logger.info(f" -> 数据路径: {self.data_file}")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
@@ -266,8 +268,7 @@ class ChatMasterPlugin(Star):
 
     @filter.command("重置检测")
     async def reset_check_status(self, event: AstrMessageEvent):
-        # 虽然逻辑上去掉了每日一次的限制，但这个指令保留着也没坏处，
-        # 可以作为"强制重置所有状态"的备用手段
+        # 即使去掉了每日限制，这个指令也可以用来强制刷新最后运行时间记录
         self.last_processed_minute = -1
         yield event.plain_result("✅ 调度器状态已重置，下一分钟即可再次触发。")
 
@@ -294,22 +295,21 @@ class ChatMasterPlugin(Star):
 
     async def check_schedule(self, target_h: int, target_m: int):
         now = datetime.now()
+        
         current_minutes = now.hour * 60 + now.minute
         target_minutes = target_h * 60 + target_m
         
-        # 1. 状态锁：防止同一分钟重复执行 (防重入)
+        # 1. 状态锁：防止同一分钟重复执行
         if current_minutes == self.last_processed_minute:
             return
         
-        # 2. 核心修改：移除"日期锁"，改为"精准时刻触发"
-        # 只要当前时间等于设定时间，就触发。
+        # 2. 精准时刻触发 (不再限制每日一次)
         if current_minutes == target_minutes:
-            self.last_processed_minute = current_minutes # 更新锁
+            self.last_processed_minute = current_minutes
             
             logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d}，执行任务...")
             await self.run_inspection(send_message=True)
             
-            # 记录一下运行时间 (仅作参考)
             self.data["global_last_run_date"] = now.strftime("%Y-%m-%d")
             self.data_changed = True
             await self.save_data()
@@ -386,7 +386,6 @@ class ChatMasterPlugin(Star):
                         final_msg = "\n".join(msg_list)
                         
                         success = False
-                        # 方案A：标准推送
                         if not success:
                             try:
                                 await asyncio.wait_for(
@@ -400,7 +399,6 @@ class ChatMasterPlugin(Star):
                             except Exception as e:
                                 log_lines.append(f"  -> ⚠️ 标准推送失败 ({e})，尝试事件缓存...")
                         
-                        # 方案B：事件缓存
                         if not success:
                             cached_event = self.group_event_cache.get(group_id)
                             if cached_event:
@@ -419,7 +417,7 @@ class ChatMasterPlugin(Star):
                                 logger.warning(f"ChatMaster: 群 {group_id} 无缓存，且标准推送失败。")
 
                     else:
-                        log_lines.append(f"  -> 结论: ⚠️ 发现潜水人员，但设置为不发送。")
+                        log_lines.append(f"  -> 结论: ⚠️ 发现潜水人员，但 [今日已推送过] (拦截发送)。")
                         logger.info("\n".join(log_lines))
                 else:
                     log_lines.append("  -> 结论: ✅ 全员活跃 (无需推送)。")
