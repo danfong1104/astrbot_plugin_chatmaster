@@ -1,5 +1,5 @@
 name: astrbot_plugin_chatmaster
-version: 2.1.0
+version: 2.1.1
 author: danfong1104
 desc: 活跃度监控插件，支持白名单/全员监控切换，每日定时日报。
 repo: https://github.com/danfong1104/astrbot_plugin_chatmaster
