@@ -8,12 +8,13 @@ from datetime import datetime
 from typing import Dict, Any, Tuple
 from pathlib import Path
 
-from astrbot.api.all import Context, AstrMessageEvent, Star
+# 1. 引入必要的消息构建类
+from astrbot.api.all import Context, AstrMessageEvent, Star, MessageChain
+from astrbot.api.message_components import Plain
 from astrbot.api.event import filter
 from astrbot.api import logger
 from astrbot.api.star import StarTools
 
-# 修复点：移除了 @register 装饰器，AstrBot 会自动识别 Star 子类
 class ChatMasterPlugin(Star):
     SAVE_INTERVAL = 300       # 自动保存间隔
     CHECK_INTERVAL = 60       # 检查循环间隔
@@ -30,7 +31,6 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
-        # 路径操作：全量 Pathlib 化
         self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = self.data_dir / "data.json"
         
@@ -45,17 +45,16 @@ class ChatMasterPlugin(Star):
         self.enable_whitelist_global = True
         self.enable_mapping = True
         
+        # 事件缓存：用于后台主动推送
         self.group_event_cache: Dict[str, AstrMessageEvent] = {}
         
-        # 调度器状态锁
         self.last_processed_minute = -1
         
         self.refresh_config_cache()
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
         server_time = datetime.now().strftime("%H:%M")
-        logger.info(f"ChatMaster v2.1.1 已加载 (Fix NameError)。")
-        logger.info(f" -> 数据路径: {self.data_file}")
+        logger.info(f"ChatMaster v2.1.2 已加载 (MessageChain Fix)。")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
@@ -201,6 +200,7 @@ class ChatMasterPlugin(Star):
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
         
+        # 缓存事件，这对于后台推送至关重要
         self.group_event_cache[group_id] = event
         
         if group_id not in self.monitored_groups_set:
@@ -268,7 +268,6 @@ class ChatMasterPlugin(Star):
 
     @filter.command("重置检测")
     async def reset_check_status(self, event: AstrMessageEvent):
-        # 即使去掉了每日限制，这个指令也可以用来强制刷新最后运行时间记录
         self.last_processed_minute = -1
         yield event.plain_result("✅ 调度器状态已重置，下一分钟即可再次触发。")
 
@@ -295,21 +294,16 @@ class ChatMasterPlugin(Star):
 
     async def check_schedule(self, target_h: int, target_m: int):
         now = datetime.now()
-        
         current_minutes = now.hour * 60 + now.minute
         target_minutes = target_h * 60 + target_m
         
-        # 1. 状态锁：防止同一分钟重复执行
         if current_minutes == self.last_processed_minute:
             return
         
-        # 2. 精准时刻触发 (不再限制每日一次)
         if current_minutes == target_minutes:
             self.last_processed_minute = current_minutes
-            
             logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d}，执行任务...")
             await self.run_inspection(send_message=True)
-            
             self.data["global_last_run_date"] = now.strftime("%Y-%m-%d")
             self.data_changed = True
             await self.save_data()
@@ -385,39 +379,31 @@ class ChatMasterPlugin(Star):
                         
                         final_msg = "\n".join(msg_list)
                         
+                        # 2. 核心修复：使用 MessageChain 和位置参数调用 send_message
                         success = False
-                        if not success:
+                        
+                        # 必须有缓存事件才能发送 (因为不知道平台/Adapter)
+                        cached_event = self.group_event_cache.get(group_id)
+                        
+                        if cached_event:
                             try:
+                                # 构建消息链
+                                chain = MessageChain([Plain(f"📢 潜水员日报：\n{final_msg}")])
+                                
+                                # 使用位置参数：context.send_message(event, message_chain)
                                 await asyncio.wait_for(
-                                    self.context.send_message(
-                                        group_id=group_id, 
-                                        message_str=f"📢 潜水员日报：\n{final_msg}"
-                                    ),
+                                    self.context.send_message(cached_event, chain),
                                     timeout=self.SEND_TIMEOUT
                                 )
                                 success = True
                             except Exception as e:
-                                log_lines.append(f"  -> ⚠️ 标准推送失败 ({e})，尝试事件缓存...")
-                        
-                        if not success:
-                            cached_event = self.group_event_cache.get(group_id)
-                            if cached_event:
-                                try:
-                                    await asyncio.wait_for(
-                                        self.context.send_message(
-                                            event=cached_event,
-                                            message_str=f"📢 潜水员日报：\n{final_msg}"
-                                        ),
-                                        timeout=self.SEND_TIMEOUT
-                                    )
-                                    success = True
-                                except Exception as e:
-                                    logger.error(f"ChatMaster: 群 {group_id} 缓存推送也失败: {e}")
-                            else:
-                                logger.warning(f"ChatMaster: 群 {group_id} 无缓存，且标准推送失败。")
+                                logger.error(f"ChatMaster: 群 {group_id} 推送失败: {e}")
+                        else:
+                            # 如果机器人刚启动，还没收到过这个群的消息，就没有 Event 对象，也就不知道怎么发
+                            logger.warning(f"ChatMaster: 群 {group_id} 推送失败。原因：机器人启动后尚未收到过该群消息，无法获取发送上下文。请在该群任意发言一次后重试。")
 
                     else:
-                        log_lines.append(f"  -> 结论: ⚠️ 发现潜水人员，但 [今日已推送过] (拦截发送)。")
+                        log_lines.append(f"  -> 结论: ⚠️ 发现潜水人员，但设置为不发送。")
                         logger.info("\n".join(log_lines))
                 else:
                     log_lines.append("  -> 结论: ✅ 全员活跃 (无需推送)。")
