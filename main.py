@@ -52,7 +52,7 @@ class ChatMasterPlugin(Star):
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
         server_time = datetime.now().strftime("%H:%M")
-        logger.info(f"ChatMaster v2.1.3 已加载 (Hotfix: Attribute Patch)。")
+        logger.info(f"ChatMaster v2.1.4 已加载 (OneBot Native Fix)。")
         logger.info(f" -> 数据路径: {self.data_file}")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
@@ -199,7 +199,6 @@ class ChatMasterPlugin(Star):
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
         
-        # 缓存事件对象
         self.group_event_cache[group_id] = event
         
         if group_id not in self.monitored_groups_set:
@@ -309,46 +308,52 @@ class ChatMasterPlugin(Star):
 
     async def _send_safe(self, event: AstrMessageEvent, message_chain: MessageChain) -> bool:
         """
-        [核心修复] 多通道尝试发送消息，解决部分适配器缺失 platform_name 属性的问题
+        [v2.1.4 核心修复] 多通道强力发送
         """
-        # 1. 尝试修补事件对象属性 (Hotfix)
-        if not hasattr(event, "platform_name") and hasattr(event, "platform"):
-            try:
-                # 尝试从平台元数据中获取名称并注入
-                event.platform_name = event.platform.meta.name
-            except:
-                pass
+        err_logs = []
 
-        # 2. 通道A: 标准 Context 发送
+        # 1. 通道A: 标准 Context 发送 (尝试修复 platform_name)
         try:
+            if not hasattr(event, "platform_name") and hasattr(event, "platform"):
+                event.platform_name = getattr(event.platform.meta, "name", "unknown")
+            
             await asyncio.wait_for(
                 self.context.send_message(event, message_chain), 
                 timeout=self.SEND_TIMEOUT
             )
             return True
-        except Exception as e1:
-            # 3. 通道B: 尝试直接调用 Platform 发送 (绕过 Context 检查)
-            try:
-                if hasattr(event, "platform"):
-                    await asyncio.wait_for(
-                        event.platform.send_message(event, message_chain),
-                        timeout=self.SEND_TIMEOUT
-                    )
-                    return True
-            except Exception as e2:
-                # 4. 通道C: 尝试 Session/Adapter 原生发送 (最后兜底)
-                # 这通常适用于 aiocqhttp 等原生对象暴露较多的适配器
-                try:
-                    # 尝试寻找 session 对象 (不同适配器位置不同)
-                    session = getattr(event, "session", None) or getattr(event, "bot", None)
-                    if session and hasattr(session, "send"):
-                         # 这里的 message 格式可能需要转换，尝试直接发字符串
-                        raw_msg = message_chain.to_plain_text()
-                        await session.send(event, raw_msg)
-                        return True
-                except Exception as e3:
-                    logger.error(f"ChatMaster Send Failed: [Ctx: {e1}] [Plat: {e2}] [Ses: {e3}]")
-        
+        except Exception as e:
+            err_logs.append(f"Context: {e}")
+
+        # 2. 通道B: Platform 直调 (绕过 Context 检查)
+        try:
+            if hasattr(event, "platform"):
+                await asyncio.wait_for(
+                    event.platform.send_message(event, message_chain),
+                    timeout=self.SEND_TIMEOUT
+                )
+                return True
+        except Exception as e:
+            err_logs.append(f"Platform: {e}")
+
+        # 3. 通道C: OneBot/Aiocqhttp 原生 bot.send_group_msg (终极兜底)
+        # 很多适配器会把 bot 实例挂在 event 上
+        try:
+            bot = getattr(event, "bot", None)
+            if bot and hasattr(bot, "send_group_msg"):
+                # 获取群号 (OneBot 11 标准参数)
+                group_id = event.message_obj.group_id
+                # 简单处理：转为纯文本发送，防止 JSON 结构不兼容
+                raw_text = message_chain.to_plain_text()
+                
+                # 直接调用 API
+                await bot.send_group_msg(group_id=int(group_id), message=raw_text)
+                return True
+        except Exception as e:
+            err_logs.append(f"NativeBot: {e}")
+
+        # 如果全挂了，打印详细死因
+        logger.error(f"ChatMaster Send All Failed: [{'; '.join(err_logs)}]")
         return False
 
     async def run_inspection(self, send_message: bool = True):
@@ -421,6 +426,7 @@ class ChatMasterPlugin(Star):
                         logger.info("\n".join(log_lines))
                         
                         final_msg = "\n".join(msg_list)
+                        # 构建标准消息链
                         chain = MessageChain([Plain(f"📢 潜水员日报：\n{final_msg}")])
                         
                         cached_event = self.group_event_cache.get(group_id)
@@ -428,7 +434,8 @@ class ChatMasterPlugin(Star):
                             # 使用强化的发送函数
                             success = await self._send_safe(cached_event, chain)
                             if not success:
-                                logger.error(f"ChatMaster: 群 {group_id} 所有发送尝试均失败。")
+                                # 如果这里报错，请把 ERROR 日志发给我，里面会有详细死因
+                                pass 
                         else:
                             logger.warning(f"ChatMaster: 群 {group_id} 推送失败。原因：机器人启动后尚未收到过该群消息。")
                     else:
