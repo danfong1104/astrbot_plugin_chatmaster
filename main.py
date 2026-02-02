@@ -8,8 +8,8 @@ from datetime import datetime
 from typing import Dict, Any, Tuple
 from pathlib import Path
 
-from astrbot.api.all import Context, AstrMessageEvent, Star, MessageChain
-from astrbot.api.message_components import Plain
+# 1. 纯净导入，绝不引入 MessageChain
+from astrbot.api.all import Context, AstrMessageEvent, Star
 from astrbot.api.event import filter
 from astrbot.api import logger
 from astrbot.api.star import StarTools
@@ -30,6 +30,9 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
+        # 全局 Bot 实例
+        self.global_bot = None
+        
         self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = self.data_dir / "data.json"
         
@@ -44,16 +47,14 @@ class ChatMasterPlugin(Star):
         self.enable_whitelist_global = True
         self.enable_mapping = True
         
-        self.group_event_cache: Dict[str, AstrMessageEvent] = {}
-        
         self.last_processed_minute = -1
         
         self.refresh_config_cache()
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
         server_time = datetime.now().strftime("%H:%M")
-        logger.info(f"ChatMaster v2.1.4 已加载 (OneBot Native Fix)。")
-        logger.info(f" -> 数据路径: {self.data_file}")
+        # ⚠️ 请确认启动日志里显示的是 v2.1.8 ⚠️
+        logger.info(f"ChatMaster v2.1.8 (Final Check) 已加载。")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
@@ -192,14 +193,17 @@ class ChatMasterPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
+        # 捕获 Bot 实例
+        if not self.global_bot:
+            self.global_bot = event.bot
+            logger.info("ChatMaster: Bot 实例已捕获。")
+
         message_obj = event.message_obj
         if not message_obj.group_id or not message_obj.sender:
             return
 
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
-        
-        self.group_event_cache[group_id] = event
         
         if group_id not in self.monitored_groups_set:
             return
@@ -216,6 +220,9 @@ class ChatMasterPlugin(Star):
 
     @filter.command("聊天检测")
     async def manual_check(self, event: AstrMessageEvent):
+        if not self.global_bot:
+            self.global_bot = event.bot
+
         message_obj = event.message_obj
         if not message_obj.group_id:
             yield event.plain_result("🚫 请在群聊中使用此命令。")
@@ -306,57 +313,13 @@ class ChatMasterPlugin(Star):
             self.data_changed = True
             await self.save_data()
 
-    async def _send_safe(self, event: AstrMessageEvent, message_chain: MessageChain) -> bool:
-        """
-        [v2.1.4 核心修复] 多通道强力发送
-        """
-        err_logs = []
-
-        # 1. 通道A: 标准 Context 发送 (尝试修复 platform_name)
-        try:
-            if not hasattr(event, "platform_name") and hasattr(event, "platform"):
-                event.platform_name = getattr(event.platform.meta, "name", "unknown")
-            
-            await asyncio.wait_for(
-                self.context.send_message(event, message_chain), 
-                timeout=self.SEND_TIMEOUT
-            )
-            return True
-        except Exception as e:
-            err_logs.append(f"Context: {e}")
-
-        # 2. 通道B: Platform 直调 (绕过 Context 检查)
-        try:
-            if hasattr(event, "platform"):
-                await asyncio.wait_for(
-                    event.platform.send_message(event, message_chain),
-                    timeout=self.SEND_TIMEOUT
-                )
-                return True
-        except Exception as e:
-            err_logs.append(f"Platform: {e}")
-
-        # 3. 通道C: OneBot/Aiocqhttp 原生 bot.send_group_msg (终极兜底)
-        # 很多适配器会把 bot 实例挂在 event 上
-        try:
-            bot = getattr(event, "bot", None)
-            if bot and hasattr(bot, "send_group_msg"):
-                # 获取群号 (OneBot 11 标准参数)
-                group_id = event.message_obj.group_id
-                # 简单处理：转为纯文本发送，防止 JSON 结构不兼容
-                raw_text = message_chain.to_plain_text()
-                
-                # 直接调用 API
-                await bot.send_group_msg(group_id=int(group_id), message=raw_text)
-                return True
-        except Exception as e:
-            err_logs.append(f"NativeBot: {e}")
-
-        # 如果全挂了，打印详细死因
-        logger.error(f"ChatMaster Send All Failed: [{'; '.join(err_logs)}]")
-        return False
-
     async def run_inspection(self, send_message: bool = True):
+        # 3. 检查 Bot 实例
+        if not self.global_bot:
+            if send_message:
+                logger.error("ChatMaster: ❌ 严重错误 - 尚未捕获 Bot 实例。请确保插件启动后，群里至少有一条新消息（任意人发送）。")
+            return
+
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
         timeout_seconds = timeout_days_cfg * 24 * 3600
         template = self.config.get("alert_template", "“{nickname}”已经“{days}”天没发言了")
@@ -426,18 +389,27 @@ class ChatMasterPlugin(Star):
                         logger.info("\n".join(log_lines))
                         
                         final_msg = "\n".join(msg_list)
-                        # 构建标准消息链
-                        chain = MessageChain([Plain(f"📢 潜水员日报：\n{final_msg}")])
+                        full_text = f"📢 潜水员日报：\n{final_msg}"
                         
-                        cached_event = self.group_event_cache.get(group_id)
-                        if cached_event:
-                            # 使用强化的发送函数
-                            success = await self._send_safe(cached_event, chain)
-                            if not success:
-                                # 如果这里报错，请把 ERROR 日志发给我，里面会有详细死因
-                                pass 
-                        else:
-                            logger.warning(f"ChatMaster: 群 {group_id} 推送失败。原因：机器人启动后尚未收到过该群消息。")
+                        # 4. 终极调用：抄作业 (send_group_msg)
+                        try:
+                            # 强制转 int，防止 group_id 是字符串导致 OneBot 报错
+                            group_id_int = int(str(group_id))
+                            msg_str = str(full_text)
+                            
+                            # 这里没有 MessageChain，没有 _send_safe，只有最纯粹的 API 调用
+                            await asyncio.wait_for(
+                                self.global_bot.api.call_action(
+                                    "send_group_msg", 
+                                    group_id=group_id_int, 
+                                    message=msg_str
+                                ),
+                                timeout=self.SEND_TIMEOUT
+                            )
+                            logger.info(f"ChatMaster: ✅ 群 {group_id} 推送成功 (Native API)")
+                        except Exception as e:
+                            logger.error(f"ChatMaster: ❌ 群 {group_id} Native API 调用失败: {e}")
+
                     else:
                         log_lines.append(f"  -> 结论: ⚠️ 发现潜水人员，但设置为不发送。")
                         logger.info("\n".join(log_lines))
