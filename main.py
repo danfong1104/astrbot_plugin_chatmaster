@@ -8,7 +8,6 @@ from datetime import datetime
 from typing import Dict, Any, Tuple
 from pathlib import Path
 
-# 1. 引入必要的消息构建类
 from astrbot.api.all import Context, AstrMessageEvent, Star, MessageChain
 from astrbot.api.message_components import Plain
 from astrbot.api.event import filter
@@ -45,7 +44,6 @@ class ChatMasterPlugin(Star):
         self.enable_whitelist_global = True
         self.enable_mapping = True
         
-        # 事件缓存：用于后台主动推送
         self.group_event_cache: Dict[str, AstrMessageEvent] = {}
         
         self.last_processed_minute = -1
@@ -54,7 +52,8 @@ class ChatMasterPlugin(Star):
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
         server_time = datetime.now().strftime("%H:%M")
-        logger.info(f"ChatMaster v2.1.2 已加载 (MessageChain Fix)。")
+        logger.info(f"ChatMaster v2.1.3 已加载 (Hotfix: Attribute Patch)。")
+        logger.info(f" -> 数据路径: {self.data_file}")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
@@ -200,7 +199,7 @@ class ChatMasterPlugin(Star):
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
         
-        # 缓存事件，这对于后台推送至关重要
+        # 缓存事件对象
         self.group_event_cache[group_id] = event
         
         if group_id not in self.monitored_groups_set:
@@ -308,6 +307,50 @@ class ChatMasterPlugin(Star):
             self.data_changed = True
             await self.save_data()
 
+    async def _send_safe(self, event: AstrMessageEvent, message_chain: MessageChain) -> bool:
+        """
+        [核心修复] 多通道尝试发送消息，解决部分适配器缺失 platform_name 属性的问题
+        """
+        # 1. 尝试修补事件对象属性 (Hotfix)
+        if not hasattr(event, "platform_name") and hasattr(event, "platform"):
+            try:
+                # 尝试从平台元数据中获取名称并注入
+                event.platform_name = event.platform.meta.name
+            except:
+                pass
+
+        # 2. 通道A: 标准 Context 发送
+        try:
+            await asyncio.wait_for(
+                self.context.send_message(event, message_chain), 
+                timeout=self.SEND_TIMEOUT
+            )
+            return True
+        except Exception as e1:
+            # 3. 通道B: 尝试直接调用 Platform 发送 (绕过 Context 检查)
+            try:
+                if hasattr(event, "platform"):
+                    await asyncio.wait_for(
+                        event.platform.send_message(event, message_chain),
+                        timeout=self.SEND_TIMEOUT
+                    )
+                    return True
+            except Exception as e2:
+                # 4. 通道C: 尝试 Session/Adapter 原生发送 (最后兜底)
+                # 这通常适用于 aiocqhttp 等原生对象暴露较多的适配器
+                try:
+                    # 尝试寻找 session 对象 (不同适配器位置不同)
+                    session = getattr(event, "session", None) or getattr(event, "bot", None)
+                    if session and hasattr(session, "send"):
+                         # 这里的 message 格式可能需要转换，尝试直接发字符串
+                        raw_msg = message_chain.to_plain_text()
+                        await session.send(event, raw_msg)
+                        return True
+                except Exception as e3:
+                    logger.error(f"ChatMaster Send Failed: [Ctx: {e1}] [Plat: {e2}] [Ses: {e3}]")
+        
+        return False
+
     async def run_inspection(self, send_message: bool = True):
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
         timeout_seconds = timeout_days_cfg * 24 * 3600
@@ -378,30 +421,16 @@ class ChatMasterPlugin(Star):
                         logger.info("\n".join(log_lines))
                         
                         final_msg = "\n".join(msg_list)
+                        chain = MessageChain([Plain(f"📢 潜水员日报：\n{final_msg}")])
                         
-                        # 2. 核心修复：使用 MessageChain 和位置参数调用 send_message
-                        success = False
-                        
-                        # 必须有缓存事件才能发送 (因为不知道平台/Adapter)
                         cached_event = self.group_event_cache.get(group_id)
-                        
                         if cached_event:
-                            try:
-                                # 构建消息链
-                                chain = MessageChain([Plain(f"📢 潜水员日报：\n{final_msg}")])
-                                
-                                # 使用位置参数：context.send_message(event, message_chain)
-                                await asyncio.wait_for(
-                                    self.context.send_message(cached_event, chain),
-                                    timeout=self.SEND_TIMEOUT
-                                )
-                                success = True
-                            except Exception as e:
-                                logger.error(f"ChatMaster: 群 {group_id} 推送失败: {e}")
+                            # 使用强化的发送函数
+                            success = await self._send_safe(cached_event, chain)
+                            if not success:
+                                logger.error(f"ChatMaster: 群 {group_id} 所有发送尝试均失败。")
                         else:
-                            # 如果机器人刚启动，还没收到过这个群的消息，就没有 Event 对象，也就不知道怎么发
-                            logger.warning(f"ChatMaster: 群 {group_id} 推送失败。原因：机器人启动后尚未收到过该群消息，无法获取发送上下文。请在该群任意发言一次后重试。")
-
+                            logger.warning(f"ChatMaster: 群 {group_id} 推送失败。原因：机器人启动后尚未收到过该群消息。")
                     else:
                         log_lines.append(f"  -> 结论: ⚠️ 发现潜水人员，但设置为不发送。")
                         logger.info("\n".join(log_lines))
