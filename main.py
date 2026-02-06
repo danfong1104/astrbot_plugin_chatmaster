@@ -8,7 +8,6 @@ from datetime import datetime
 from typing import Dict, Any, Tuple
 from pathlib import Path
 
-# 1. 纯净导入，绝不引入 MessageChain
 from astrbot.api.all import Context, AstrMessageEvent, Star
 from astrbot.api.event import filter
 from astrbot.api import logger
@@ -30,7 +29,6 @@ class ChatMasterPlugin(Star):
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
         
-        # 全局 Bot 实例
         self.global_bot = None
         
         self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
@@ -47,14 +45,16 @@ class ChatMasterPlugin(Star):
         self.enable_whitelist_global = True
         self.enable_mapping = True
         
-        self.last_processed_minute = -1
+        # 修复核心：使用“日期+时间”作为锁，而不是单纯的“分钟数”
+        # 格式示例: "2026-02-06 09:00"
+        self.last_run_stamp = ""
         
         self.refresh_config_cache()
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
         server_time = datetime.now().strftime("%H:%M")
-        # ⚠️ 请确认启动日志里显示的是 v2.1.8 ⚠️
-        logger.info(f"ChatMaster v2.1.8 (Final Check) 已加载。")
+        # 打印版本号确认更新
+        logger.info(f"ChatMaster v2.2.0 (DateLock Fix) 已加载。")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
@@ -191,9 +191,9 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
+    # 保留 *args 修复，防止与其他插件冲突
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def on_message(self, event: AstrMessageEvent):
-        # 捕获 Bot 实例
+    async def on_message(self, event: AstrMessageEvent, *args):
         if not self.global_bot:
             self.global_bot = event.bot
             logger.info("ChatMaster: Bot 实例已捕获。")
@@ -219,7 +219,7 @@ class ChatMasterPlugin(Star):
         self.data_changed = True 
 
     @filter.command("聊天检测")
-    async def manual_check(self, event: AstrMessageEvent):
+    async def manual_check(self, event: AstrMessageEvent, *args):
         if not self.global_bot:
             self.global_bot = event.bot
 
@@ -272,8 +272,8 @@ class ChatMasterPlugin(Star):
         yield event.plain_result("\n".join(msg_lines))
 
     @filter.command("重置检测")
-    async def reset_check_status(self, event: AstrMessageEvent):
-        self.last_processed_minute = -1
+    async def reset_check_status(self, event: AstrMessageEvent, *args):
+        self.last_run_stamp = ""
         yield event.plain_result("✅ 调度器状态已重置，下一分钟即可再次触发。")
 
     async def scheduler_loop(self):
@@ -299,25 +299,32 @@ class ChatMasterPlugin(Star):
 
     async def check_schedule(self, target_h: int, target_m: int):
         now = datetime.now()
-        current_minutes = now.hour * 60 + now.minute
-        target_minutes = target_h * 60 + target_m
         
-        if current_minutes == self.last_processed_minute:
+        # 1. 生成当前的“日期+分钟”指纹 (YYYY-MM-DD HH:MM)
+        # 这保证了明天同一时间，指纹会变，从而可以再次触发
+        current_stamp = now.strftime("%Y-%m-%d %H:%M")
+        
+        # 2. 如果当前指纹和上次运行的一样，说明这一分钟已经跑过了，跳过
+        if current_stamp == self.last_run_stamp:
             return
         
-        if current_minutes == target_minutes:
-            self.last_processed_minute = current_minutes
-            logger.info(f"ChatMaster: ⏰ 到达推送时间 {target_h:02d}:{target_m:02d}，执行任务...")
+        # 3. 检查时间是否匹配配置
+        if now.hour == target_h and now.minute == target_m:
+            # 锁定当前分钟 (内存锁)
+            self.last_run_stamp = current_stamp
+            
+            logger.info(f"ChatMaster: ⏰ 到达推送时间 {current_stamp}，执行任务...")
             await self.run_inspection(send_message=True)
+            
+            # 更新磁盘上的最后运行日期 (虽然现在逻辑不强依赖它，但留着做日志记录)
             self.data["global_last_run_date"] = now.strftime("%Y-%m-%d")
             self.data_changed = True
             await self.save_data()
 
     async def run_inspection(self, send_message: bool = True):
-        # 3. 检查 Bot 实例
         if not self.global_bot:
             if send_message:
-                logger.error("ChatMaster: ❌ 严重错误 - 尚未捕获 Bot 实例。请确保插件启动后，群里至少有一条新消息（任意人发送）。")
+                logger.warning("ChatMaster: 尚未捕获 Bot 实例（插件启动后尚未收到消息），跳过本次推送。")
             return
 
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
@@ -391,13 +398,11 @@ class ChatMasterPlugin(Star):
                         final_msg = "\n".join(msg_list)
                         full_text = f"📢 潜水员日报：\n{final_msg}"
                         
-                        # 4. 终极调用：抄作业 (send_group_msg)
+                        # 4. Native API 推送 (保持不变)
                         try:
-                            # 强制转 int，防止 group_id 是字符串导致 OneBot 报错
                             group_id_int = int(str(group_id))
                             msg_str = str(full_text)
                             
-                            # 这里没有 MessageChain，没有 _send_safe，只有最纯粹的 API 调用
                             await asyncio.wait_for(
                                 self.global_bot.api.call_action(
                                     "send_group_msg", 
