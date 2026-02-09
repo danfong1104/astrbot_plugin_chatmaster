@@ -45,16 +45,14 @@ class ChatMasterPlugin(Star):
         self.enable_whitelist_global = True
         self.enable_mapping = True
         
-        # 修复核心：使用“日期+时间”作为锁，而不是单纯的“分钟数”
-        # 格式示例: "2026-02-06 09:00"
+        # 使用“日期+时间”作为锁，确保修改时间后能重新触发
         self.last_run_stamp = ""
         
         self.refresh_config_cache()
         self.push_time_h, self.push_time_m = self._parse_push_time()
         
         server_time = datetime.now().strftime("%H:%M")
-        # 打印版本号确认更新
-        logger.info(f"ChatMaster v2.2.0 (DateLock Fix) 已加载。")
+        logger.info(f"ChatMaster v2.2.1 (Calendar Fix) 已加载。")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
@@ -191,7 +189,6 @@ class ChatMasterPlugin(Star):
             return self.nickname_cache[user_id]
         return f"用户{user_id}"
 
-    # 保留 *args 修复，防止与其他插件冲突
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent, *args):
         if not self.global_bot:
@@ -237,7 +234,8 @@ class ChatMasterPlugin(Star):
         group_data = self.data["groups"][group_id]
         msg_lines = [f"📊 群 ({group_id}) 活跃度数据概览："]
         
-        now = time.time()
+        now_ts = time.time()
+        now_dt = datetime.fromtimestamp(now_ts)
         count = 0
         
         self.refresh_config_cache()
@@ -261,11 +259,13 @@ class ChatMasterPlugin(Star):
             last_seen_dt = datetime.fromtimestamp(last_seen_ts)
             last_seen_str = last_seen_dt.strftime('%Y-%m-%d %H:%M:%S')
             
-            diff_seconds = now - last_seen_ts
-            days = int(diff_seconds // 86400)
+            # 修复核心：计算自然日差，更符合直觉
+            delta_days = (now_dt.date() - last_seen_dt.date()).days
             
-            status_emoji = "🟢" if days < 1 else "🔴"
-            msg_lines.append(f"{status_emoji} {nickname} | 未发言: {days}天 | 最后: {last_seen_str}")
+            # 如果是同一天，显示 "今天" 或 "0天"
+            # 如果不是同一天，则显示日历天数差
+            status_emoji = "🟢" if delta_days < 1 else "🔴"
+            msg_lines.append(f"{status_emoji} {nickname} | 未发言: {delta_days}天 | 最后: {last_seen_str}")
             count += 1
 
         msg_lines.append(f"\n共记录 {count} 人。")
@@ -299,24 +299,15 @@ class ChatMasterPlugin(Star):
 
     async def check_schedule(self, target_h: int, target_m: int):
         now = datetime.now()
-        
-        # 1. 生成当前的“日期+分钟”指纹 (YYYY-MM-DD HH:MM)
-        # 这保证了明天同一时间，指纹会变，从而可以再次触发
         current_stamp = now.strftime("%Y-%m-%d %H:%M")
         
-        # 2. 如果当前指纹和上次运行的一样，说明这一分钟已经跑过了，跳过
         if current_stamp == self.last_run_stamp:
             return
         
-        # 3. 检查时间是否匹配配置
         if now.hour == target_h and now.minute == target_m:
-            # 锁定当前分钟 (内存锁)
             self.last_run_stamp = current_stamp
-            
             logger.info(f"ChatMaster: ⏰ 到达推送时间 {current_stamp}，执行任务...")
             await self.run_inspection(send_message=True)
-            
-            # 更新磁盘上的最后运行日期 (虽然现在逻辑不强依赖它，但留着做日志记录)
             self.data["global_last_run_date"] = now.strftime("%Y-%m-%d")
             self.data_changed = True
             await self.save_data()
@@ -324,13 +315,16 @@ class ChatMasterPlugin(Star):
     async def run_inspection(self, send_message: bool = True):
         if not self.global_bot:
             if send_message:
-                logger.warning("ChatMaster: 尚未捕获 Bot 实例（插件启动后尚未收到消息），跳过本次推送。")
+                logger.error("ChatMaster: ❌ 严重错误 - 尚未捕获 Bot 实例。")
             return
 
+        # 阈值保持物理时间，用于判断是否"达标"
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
         timeout_seconds = timeout_days_cfg * 24 * 3600
+        
         template = self.config.get("alert_template", "“{nickname}”已经“{days}”天没发言了")
         now_ts = time.time()
+        now_dt = datetime.fromtimestamp(now_ts)
 
         if not self.monitored_groups_set:
             return
@@ -364,19 +358,24 @@ class ChatMasterPlugin(Star):
                     nickname = self._get_display_name(user_id)
                     time_diff = now_ts - last_seen_ts
                     
+                    # 1. 阈值判断：依然使用严格秒数，防止误判
                     if time_diff >= timeout_seconds:
-                        days_silent = int(time_diff // 86400)
-                        last_seen_str = datetime.fromtimestamp(last_seen_ts).strftime('%Y-%m-%d %H:%M:%S')
+                        last_seen_dt = datetime.fromtimestamp(last_seen_ts)
+                        last_seen_str = last_seen_dt.strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        # 2. 显示优化：使用日历天数 (Date Delta)，解决向下取整问题
+                        # 2月6日到2月9日 = 3天
+                        delta_days = (now_dt.date() - last_seen_dt.date()).days
                         
                         if count < self.MAX_DISPLAY_COUNT:
                             line = template.format(
                                 nickname=nickname, 
-                                days=days_silent, 
+                                days=delta_days, # 这里使用修正后的自然天数
                                 last_seen=last_seen_str
                             )
                             msg_list.append(line)
                         
-                        inactive_names.append(f"{nickname}({days_silent}天)")
+                        inactive_names.append(f"{nickname}({delta_days}天)")
                     else:
                         active_names.append(nickname)
                     
@@ -398,7 +397,6 @@ class ChatMasterPlugin(Star):
                         final_msg = "\n".join(msg_list)
                         full_text = f"📢 潜水员日报：\n{final_msg}"
                         
-                        # 4. Native API 推送 (保持不变)
                         try:
                             group_id_int = int(str(group_id))
                             msg_str = str(full_text)
@@ -411,7 +409,7 @@ class ChatMasterPlugin(Star):
                                 ),
                                 timeout=self.SEND_TIMEOUT
                             )
-                            logger.info(f"ChatMaster: ✅ 群 {group_id} 推送成功 (Native API)")
+                            logger.info(f"ChatMaster: ✅ 群 {group_id} 推送成功")
                         except Exception as e:
                             logger.error(f"ChatMaster: ❌ 群 {group_id} Native API 调用失败: {e}")
 
