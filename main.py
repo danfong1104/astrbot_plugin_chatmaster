@@ -25,34 +25,34 @@ class ChatMasterPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
-        self.data_changed = False 
+        self.data_changed = False
         self.last_save_time = time.time()
         self.last_cleanup_time = time.time()
-        
+
         self.global_bot = None
-        
+
         self.data_dir: Path = StarTools.get_data_dir("astrbot_plugin_chatmaster")
         self.data_file = self.data_dir / "data.json"
-        
+
         if not self.data_dir.exists():
             self.data_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.data = self.load_data()
-        
+
         self.nickname_cache = {}
         self.monitored_groups_set = set()
         self.exception_groups_set = set()
         self.enable_whitelist_global = True
         self.enable_mapping = True
-        
-        # 使用“日期+时间”作为锁，确保修改时间后能重新触发
+
+        # 使用"日期+时间"作为锁，确保修改时间后能重新触发
         self.last_run_stamp = ""
-        
+
         self.refresh_config_cache()
         self.push_time_h, self.push_time_m = self._parse_push_time()
-        
+
         server_time = datetime.now().strftime("%H:%M")
-        logger.info(f"ChatMaster v2.2.1 (Calendar Fix) 已加载。")
+        logger.info(f"ChatMaster v2.2.2 (Command Fix) 已加载。")
         logger.info(f" -> 服务器时间: {server_time}")
         logger.info(f" -> 设定推送时间: {self.push_time_h:02d}:{self.push_time_m:02d}")
 
@@ -72,10 +72,10 @@ class ChatMasterPlugin(Star):
     def refresh_config_cache(self):
         self.enable_whitelist_global = self.config.get("enable_whitelist", True)
         self.enable_mapping = self.config.get("enable_nickname_mapping", True)
-        
+
         raw_groups = self.config.get("monitored_groups", [])
         self.monitored_groups_set = set(str(g) for g in raw_groups)
-        
+
         raw_exceptions = self.config.get("whitelist_exception_groups", [])
         self.exception_groups_set = set(str(g) for g in raw_exceptions)
 
@@ -94,7 +94,7 @@ class ChatMasterPlugin(Star):
                             parts = item_str.split(":", 1)
                         elif "：" in item_str:
                             parts = item_str.split("：", 1)
-                        
+
                         if len(parts) == 2:
                             qq = parts[0].strip()
                             name = parts[1].strip()
@@ -159,18 +159,18 @@ class ChatMasterPlugin(Star):
         cutoff_time = time.time() - (self.CLEANUP_DAYS * 24 * 3600)
         removed_count = 0
         groups_to_check = list(self.data["groups"].keys())
-        
+
         for i, group_id in enumerate(groups_to_check):
             if i % 10 == 0: await asyncio.sleep(0)
-            
+
             group_data = self.data["groups"].get(group_id)
             if group_data is None: continue
-                
+
             users_to_remove = [uid for uid, ts in group_data.items() if ts < cutoff_time]
             for uid in users_to_remove:
                 del group_data[uid]
                 removed_count += 1
-                
+
         if removed_count > 0:
             logger.info(f"ChatMaster: 自动清理了 {removed_count} 条过期数据。")
             self.data_changed = True
@@ -190,7 +190,7 @@ class ChatMasterPlugin(Star):
         return f"用户{user_id}"
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def on_message(self, event: AstrMessageEvent, *args):
+    async def on_message(self, event: AstrMessageEvent):
         if not self.global_bot:
             self.global_bot = event.bot
             logger.info("ChatMaster: Bot 实例已捕获。")
@@ -201,22 +201,23 @@ class ChatMasterPlugin(Star):
 
         group_id = str(message_obj.group_id)
         user_id = str(message_obj.sender.user_id)
-        
+
         if group_id not in self.monitored_groups_set:
             return
 
         use_whitelist = self._is_group_whitelist_mode(group_id)
         if use_whitelist and user_id not in self.nickname_cache:
-            return 
-        
+            return
+
         if group_id not in self.data["groups"]:
             self.data["groups"][group_id] = {}
 
         self.data["groups"][group_id][user_id] = time.time()
-        self.data_changed = True 
+        self.data_changed = True
 
     @filter.command("聊天检测")
-    async def manual_check(self, event: AstrMessageEvent, *args):
+    async def manual_check(self, event: AstrMessageEvent):
+        """手动触发聊天检测，显示当前群的活跃数据概览。"""
         if not self.global_bot:
             self.global_bot = event.bot
 
@@ -226,31 +227,31 @@ class ChatMasterPlugin(Star):
             return
 
         group_id = str(message_obj.group_id)
-        
+
         if group_id not in self.data["groups"] or not self.data["groups"][group_id]:
             yield event.plain_result(f"📭 群 ({group_id}) 暂无监控数据。")
             return
 
         group_data = self.data["groups"][group_id]
         msg_lines = [f"📊 群 ({group_id}) 活跃度数据概览："]
-        
+
         now_ts = time.time()
         now_dt = datetime.fromtimestamp(now_ts)
         count = 0
-        
+
         self.refresh_config_cache()
         use_whitelist = self._is_group_whitelist_mode(group_id)
         mode_str = "白名单模式" if use_whitelist else "全员监控模式"
         msg_lines.append(f"当前模式: {mode_str}")
-        
+
         user_items = list(group_data.items())
-        
+
         for i, (user_id, last_seen_ts) in enumerate(user_items):
             if i % 50 == 0: await asyncio.sleep(0)
 
             if use_whitelist and user_id not in self.nickname_cache:
                 continue
-            
+
             if count >= self.MAX_DISPLAY_COUNT:
                 msg_lines.append(f"\n⚠️ (名单过长，系统截断前 {self.MAX_DISPLAY_COUNT} 位显示)")
                 break
@@ -258,10 +259,10 @@ class ChatMasterPlugin(Star):
             nickname = self._get_display_name(user_id)
             last_seen_dt = datetime.fromtimestamp(last_seen_ts)
             last_seen_str = last_seen_dt.strftime('%Y-%m-%d %H:%M:%S')
-            
+
             # 修复核心：计算自然日差，更符合直觉
             delta_days = (now_dt.date() - last_seen_dt.date()).days
-            
+
             # 如果是同一天，显示 "今天" 或 "0天"
             # 如果不是同一天，则显示日历天数差
             status_emoji = "🟢" if delta_days < 1 else "🔴"
@@ -272,7 +273,8 @@ class ChatMasterPlugin(Star):
         yield event.plain_result("\n".join(msg_lines))
 
     @filter.command("重置检测")
-    async def reset_check_status(self, event: AstrMessageEvent, *args):
+    async def reset_check_status(self, event: AstrMessageEvent):
+        """重置检测状态，使定时推送任务可以立即重新触发。"""
         self.last_run_stamp = ""
         yield event.plain_result("✅ 调度器状态已重置，下一分钟即可再次触发。")
 
@@ -282,28 +284,28 @@ class ChatMasterPlugin(Star):
                 self.refresh_config_cache()
                 target_h, target_m = self._parse_push_time()
                 await self.check_schedule(target_h, target_m)
-                
+
                 if time.time() - self.last_cleanup_time > self.CLEANUP_INTERVAL:
                     await self._cleanup_old_data_async()
                     self.last_cleanup_time = time.time()
 
                 if self.data_changed and (time.time() - self.last_save_time > self.SAVE_INTERVAL):
                     await self.save_data()
-                    
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"ChatMaster 调度出错: {e}")
-            
+
             await asyncio.sleep(self.CHECK_INTERVAL)
 
     async def check_schedule(self, target_h: int, target_m: int):
         now = datetime.now()
         current_stamp = now.strftime("%Y-%m-%d %H:%M")
-        
+
         if current_stamp == self.last_run_stamp:
             return
-        
+
         if now.hour == target_h and now.minute == target_m:
             self.last_run_stamp = current_stamp
             logger.info(f"ChatMaster: ⏰ 到达推送时间 {current_stamp}，执行任务...")
@@ -321,8 +323,8 @@ class ChatMasterPlugin(Star):
         # 阈值保持物理时间，用于判断是否"达标"
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
         timeout_seconds = timeout_days_cfg * 24 * 3600
-        
-        template = self.config.get("alert_template", "“{nickname}”已经“{days}”天没发言了")
+
+        template = self.config.get("alert_template", ""{nickname}"已经"{days}"天没发言了")
         now_ts = time.time()
         now_dt = datetime.fromtimestamp(now_ts)
 
@@ -334,7 +336,7 @@ class ChatMasterPlugin(Star):
                 group_data = self.data["groups"].get(group_id, {})
                 use_whitelist = self._is_group_whitelist_mode(group_id)
                 mode_str = "白名单" if use_whitelist else "全员"
-                
+
                 log_lines = []
                 log_lines.append(f"ChatMaster: 检测群 {group_id} [{mode_str}]...")
 
@@ -346,41 +348,41 @@ class ChatMasterPlugin(Star):
                 msg_list = []
                 active_names = []
                 inactive_names = []
-                
+
                 user_items = list(group_data.items())
-                count = 0 
+                count = 0
                 for i, (user_id, last_seen_ts) in enumerate(user_items):
                     if i % 50 == 0: await asyncio.sleep(0)
 
                     if use_whitelist and user_id not in self.nickname_cache:
                         continue
-                    
+
                     nickname = self._get_display_name(user_id)
                     time_diff = now_ts - last_seen_ts
-                    
+
                     # 1. 阈值判断：依然使用严格秒数，防止误判
                     if time_diff >= timeout_seconds:
                         last_seen_dt = datetime.fromtimestamp(last_seen_ts)
                         last_seen_str = last_seen_dt.strftime('%Y-%m-%d %H:%M:%S')
-                        
+
                         # 2. 显示优化：使用日历天数 (Date Delta)，解决向下取整问题
                         # 2月6日到2月9日 = 3天
                         delta_days = (now_dt.date() - last_seen_dt.date()).days
-                        
+
                         if count < self.MAX_DISPLAY_COUNT:
                             line = template.format(
-                                nickname=nickname, 
+                                nickname=nickname,
                                 days=delta_days, # 这里使用修正后的自然天数
                                 last_seen=last_seen_str
                             )
                             msg_list.append(line)
-                        
+
                         inactive_names.append(f"{nickname}({delta_days}天)")
                     else:
                         active_names.append(nickname)
-                    
+
                     count += 1
-                
+
                 if count > self.MAX_DISPLAY_COUNT and len(msg_list) >= self.MAX_DISPLAY_COUNT:
                      msg_list.append(f"\n⚠️ (名单过长，系统截断前 {self.MAX_DISPLAY_COUNT} 位显示)")
 
@@ -393,18 +395,18 @@ class ChatMasterPlugin(Star):
                     if send_message:
                         log_lines.append(f"  -> 结论: ❌ 发现 {len(inactive_names)} 人潜水，正在推送...")
                         logger.info("\n".join(log_lines))
-                        
+
                         final_msg = "\n".join(msg_list)
                         full_text = f"📢 潜水员日报：\n{final_msg}"
-                        
+
                         try:
                             group_id_int = int(str(group_id))
                             msg_str = str(full_text)
-                            
+
                             await asyncio.wait_for(
                                 self.global_bot.api.call_action(
-                                    "send_group_msg", 
-                                    group_id=group_id_int, 
+                                    "send_group_msg",
+                                    group_id=group_id_int,
                                     message=msg_str
                                 ),
                                 timeout=self.SEND_TIMEOUT
