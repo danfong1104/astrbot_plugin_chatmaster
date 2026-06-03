@@ -324,7 +324,7 @@ class ChatMasterPlugin(Star):
         timeout_days_cfg = float(self.config.get("timeout_days", 1.0))
         timeout_seconds = timeout_days_cfg * 24 * 3600
 
-        template = self.config.get("alert_template", ""{nickname}"已经"{days}"天没发言了")
+        template = self.config.get("alert_template", '{nickname}已经{days}天没发言了')
         now_ts = time.time()
         now_dt = datetime.fromtimestamp(now_ts)
 
